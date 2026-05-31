@@ -8,17 +8,20 @@
 
 #include "cosechat.h"
 
+/* Announce wire size: ~5KB + overhead; chat wire size: ~1.5KB */
+#define ANN_BUF_SZ  6144
+#define CHAT_BUF_SZ 2048
+
 int main(void) {
   WC_RNG rng;
-  cc_key_t alice, bob;
-  uint8_t ann_pkt[1024];
-  size_t ann_len = 0;
-  uint8_t chat_pkt[1024];
-  size_t chat_len = 0;
-  uint8_t routed[1024];
-  size_t routed_len = 0;
-  cc_announce_t bob_ann;
-  cc_chat_t chat;
+  /* Large structs — static to avoid stack overflow on ESP32 */
+  static cc_key_t alice, bob;
+  static cc_announce_t bob_ann;
+  static cc_chat_t chat, chat2, chat3;
+  static uint8_t ann_pkt[ANN_BUF_SZ];
+  static uint8_t chat_pkt[CHAT_BUF_SZ];
+  static uint8_t routed[CHAT_BUF_SZ];
+  size_t ann_len = 0, chat_len = 0, routed_len = 0;
   uint8_t recip_addr[CC_ADDR_SZ];
   uint8_t alice_addr[CC_ADDR_SZ];
   uint8_t hops;
@@ -44,8 +47,9 @@ int main(void) {
   for (i = 0; i < CC_ADDR_SZ; i++) printf("%02x", bob_ann.addr[i]);
   printf("\n");
 
-  /* Alice sends chat using Bob's pubkey from the announce */
-  ret = cc_chat_build(&alice, bob_ann.pubkey, (const uint8_t*)msg, strlen(msg),
+  /* Alice sends chat to Bob using his addr + KEM pubkey from the announce */
+  ret = cc_chat_build(&alice, bob_ann.addr, bob_ann.kem_pubkey,
+                      (const uint8_t*)msg, strlen(msg),
                       chat_pkt, sizeof(chat_pkt), &chat_len, &rng);
   if (ret != CC_OK) {
     printf("chat build error: %d\n", ret);
@@ -73,7 +77,6 @@ int main(void) {
          memcmp(chat.sender_addr, alice_addr, CC_ADDR_SZ) == 0 ? "yes" : "no");
 
   /* Wrong key cannot decrypt */
-  cc_chat_t chat2;
   ret = cc_chat_parse(&alice, chat_pkt, chat_len, &chat2);
   printf("wrong key rejected: %s\n", ret != CC_OK ? "yes" : "no");
 
@@ -82,7 +85,6 @@ int main(void) {
   cc_msg_hops(routed, routed_len, &hops);
   printf("hops after route: %d\n", hops);
 
-  cc_chat_t chat3;
   ret = cc_chat_parse(&bob, routed, routed_len, &chat3);
   printf("decrypt after hop: %s\n", ret == CC_OK ? "ok" : "FAILED");
 

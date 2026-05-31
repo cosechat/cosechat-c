@@ -8,6 +8,10 @@
 
 #include "cosechat.h"
 
+/* Wire buffer sizes for PQ key sizes */
+#define ANN_BUF_SZ  6144
+#define CHAT_BUF_SZ 2048
+
 static int g_passed = 0, g_failed = 0;
 
 #define T(name, cond)               \
@@ -22,18 +26,22 @@ static int g_passed = 0, g_failed = 0;
   } while (0)
 
 static void test_keys(WC_RNG* rng) {
-  cc_key_t key, imported;
-  uint8_t priv[32], pub[CC_PUBKEY_SZ], addr[CC_ADDR_SZ], addr2[CC_ADDR_SZ];
-  uint8_t addr3[CC_ADDR_SZ];
+  /* static: cc_key_t ~13KB, too large for embedded stack */
+  static cc_key_t key, imported;
+  uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ];
+  uint8_t kem_priv[CC_KEM_PRIVKEY_SZ];
+  uint8_t sign_pub[CC_SIGN_PUBKEY_SZ];
+  uint8_t kem_pub[CC_KEM_PUBKEY_SZ];
+  uint8_t addr[CC_ADDR_SZ], addr2[CC_ADDR_SZ], addr3[CC_ADDR_SZ];
   printf("keys:\n");
 
   T("generate", cc_key_generate(&key, rng) == CC_OK);
-  T("export_private", cc_key_export_private(&key, priv) == CC_OK);
-  T("export_public", cc_key_export_public(&key, pub) == CC_OK);
+  T("export_private", cc_key_export_private(&key, sign_priv, kem_priv) == CC_OK);
+  T("export_public", cc_key_export_public(&key, sign_pub, kem_pub) == CC_OK);
   T("addr_from_key", cc_addr_from_key(&key, addr) == CC_OK);
-  T("addr_from_pubkey", cc_addr_from_pubkey(pub, addr2) == CC_OK);
+  T("addr_from_sign_pubkey", cc_addr_from_sign_pubkey(sign_pub, addr2) == CC_OK);
   T("addr_consistent", memcmp(addr, addr2, CC_ADDR_SZ) == 0);
-  T("import", cc_key_import(&imported, priv) == CC_OK);
+  T("import", cc_key_import(&imported, sign_priv, sign_pub, kem_priv) == CC_OK);
   cc_addr_from_key(&imported, addr3);
   T("import_addr_match", memcmp(addr, addr3, CC_ADDR_SZ) == 0);
   T("null_arg", cc_key_generate(NULL, rng) == CC_E_ARG);
@@ -43,20 +51,18 @@ static void test_keys(WC_RNG* rng) {
 }
 
 static void test_announce(WC_RNG* rng) {
-  cc_key_t key;
-  uint8_t pkt[1024], pkt2[1024];
-  size_t pkt_len = 0, pkt2_len = 0;
-  cc_announce_t ann, ann2;
+  static cc_key_t key;
+  static cc_announce_t ann, ann2, ann3;
+  static uint8_t pkt[ANN_BUF_SZ], pkt2[ANN_BUF_SZ], pkt3[ANN_BUF_SZ];
+  size_t pkt_len = 0, pkt2_len = 0, pkt3_len = 0;
   uint8_t expected_addr[CC_ADDR_SZ];
-  uint8_t corrupt[1024];
-  uint8_t type;
-  uint8_t hops;
+  uint8_t corrupt[ANN_BUF_SZ];
+  uint8_t type, hops;
   printf("announce:\n");
 
   cc_key_generate(&key, rng);
 
-  T("build", cc_announce_build(&key, "Alice", 5, NULL, 0, pkt, sizeof(pkt),
-                               &pkt_len, rng) == CC_OK);
+  T("build", cc_announce_build(&key, "Alice", 5, NULL, 0, pkt, sizeof(pkt), &pkt_len, rng) == CC_OK);
   T("pkt_nonempty", pkt_len > 0);
 
   cc_msg_type(pkt, pkt_len, &type);
@@ -81,9 +87,6 @@ static void test_announce(WC_RNG* rng) {
 
   /* Metadata */
   uint8_t meta_buf[] = {0xa1, 0x01, 0x02}; /* CBOR {1: 2} */
-  uint8_t pkt3[1024];
-  size_t pkt3_len = 0;
-  cc_announce_t ann3;
   cc_announce_build(&key, "Bob", 3, meta_buf, sizeof(meta_buf), pkt3,
                     sizeof(pkt3), &pkt3_len, rng);
   T("meta_parse", cc_announce_parse(pkt3, pkt3_len, &ann3) == CC_OK);
@@ -99,11 +102,12 @@ static void test_announce(WC_RNG* rng) {
 }
 
 static void test_chat(WC_RNG* rng) {
-  cc_key_t alice, bob;
-  uint8_t ann_pkt[1024], chat_pkt[1024], routed[1024];
+  static cc_key_t alice, bob;
+  static cc_announce_t bob_ann;
+  static cc_chat_t chat, chat2, chat3;
+  static uint8_t ann_pkt[ANN_BUF_SZ];
+  static uint8_t chat_pkt[CHAT_BUF_SZ], routed[CHAT_BUF_SZ];
   size_t ann_len = 0, chat_len = 0, routed_len = 0;
-  cc_announce_t bob_ann;
-  cc_chat_t chat, chat2, chat3;
   uint8_t alice_addr[CC_ADDR_SZ], recip[CC_ADDR_SZ];
   uint8_t type, hops;
   static const char msg[] = "Hello Bob!";
@@ -118,7 +122,8 @@ static void test_chat(WC_RNG* rng) {
   cc_announce_parse(ann_pkt, ann_len, &bob_ann);
 
   T("build",
-    cc_chat_build(&alice, bob_ann.pubkey, (const uint8_t*)msg, strlen(msg),
+    cc_chat_build(&alice, bob_ann.addr, bob_ann.kem_pubkey,
+                  (const uint8_t*)msg, strlen(msg),
                   chat_pkt, sizeof(chat_pkt), &chat_len, rng) == CC_OK);
   T("pkt_nonempty", chat_len > 0);
 
@@ -131,6 +136,7 @@ static void test_chat(WC_RNG* rng) {
   T("pow_ok", cc_pow_verify(chat_pkt, chat_len) == CC_OK);
 
   ret = cc_chat_parse(&bob, chat_pkt, chat_len, &chat);
+  if (ret != CC_OK) printf("  bob parse ret=%d\n", ret);
   T("bob_decrypt", ret == CC_OK);
   T("msg_match", ret == CC_OK && chat.msg_len == strlen(msg) &&
                      memcmp(chat.msg, msg, chat.msg_len) == 0);

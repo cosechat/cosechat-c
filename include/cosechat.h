@@ -12,7 +12,7 @@
 #endif
 #include <wolfcose/wolfcose.h>
 #include <wolfssl/wolfcrypt/dilithium.h>
-#include <wolfssl/wolfcrypt/kyber.h>
+#include <wolfssl/wolfcrypt/wc_mlkem.h>
 #include <wolfssl/wolfcrypt/random.h>
 
 #ifdef __cplusplus
@@ -23,7 +23,7 @@ extern "C" {
 
 /* Algorithm selection (change here to upgrade security level) */
 #define CC_SIGN_LEVEL 2 /* ML-DSA-44 (Dilithium level 2) */
-#define CC_KEM_TYPE KYBER512
+#define CC_KEM_TYPE WC_ML_KEM_512
 
 /* ML-DSA-44 sizes */
 #define CC_SIGN_PUBKEY_SZ 1312
@@ -94,6 +94,7 @@ typedef struct {
 /* Key management */
 int cc_key_generate(cc_key_t* key, WC_RNG* rng);
 int cc_key_import(cc_key_t* key, const uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ],
+                  const uint8_t sign_pub[CC_SIGN_PUBKEY_SZ],
                   const uint8_t kem_priv[CC_KEM_PRIVKEY_SZ]);
 int cc_key_export_private(const cc_key_t* key,
                           uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ],

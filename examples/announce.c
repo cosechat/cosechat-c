@@ -8,16 +8,17 @@
 
 #include "cosechat.h"
 
+/* Announce wire size: sign1(~5KB) + outer CBOR overhead */
+#define ANN_BUF_SZ 6144
+
 int main(void) {
   WC_RNG rng;
-  cc_key_t key;
-  uint8_t pkt[1024];
-  size_t pkt_len = 0;
-  cc_announce_t ann;
-  uint8_t pkt2[1024];
-  size_t pkt2_len = 0;
-  uint8_t type;
-  uint8_t hops;
+  /* Large structs — static to avoid stack overflow on ESP32 */
+  static cc_key_t key;
+  static cc_announce_t ann, ann2;
+  static uint8_t pkt[ANN_BUF_SZ], pkt2[ANN_BUF_SZ];
+  size_t pkt_len = 0, pkt2_len = 0;
+  uint8_t type, hops;
   int i, ret;
 
   wc_InitRng(&rng);
@@ -52,7 +53,7 @@ int main(void) {
   cc_hops_increment(pkt, pkt_len, pkt2, sizeof(pkt2), &pkt2_len);
   cc_msg_hops(pkt2, pkt2_len, &hops);
   printf("after hop: hops=%d, parses_ok=%s\n", hops,
-         cc_announce_parse(pkt2, pkt2_len, &ann) == CC_OK ? "yes" : "no");
+         cc_announce_parse(pkt2, pkt2_len, &ann2) == CC_OK ? "yes" : "no");
 
   cc_key_free(&key);
   wc_FreeRng(&rng);

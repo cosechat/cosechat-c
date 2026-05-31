@@ -1,6 +1,6 @@
 {
   "name": "cosechat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "COSE/CBOR mesh chat protocol. Pubkey-addressed, encrypted, spam-resistant via PoW. Inspired by Reticulum/LXMF.",
   "keywords": ["cose", "cbor", "mesh", "chat", "lora", "encryption", "p2p", "iot"],
   "authors": [
@@ -17,8 +17,10 @@
     "srcDir": "src",
     "includeDir": "include",
     "flags": [
-      "-DHAVE_ECC",
-      "-DHAVE_ECC_DHE",
+      "-DHAVE_DILITHIUM",
+      "-DWOLFSSL_DILITHIUM_FIPS_204",
+      "-DWOLFSSL_HAVE_KYBER",
+      "-DWOLFSSL_KYBER512",
       "-DHAVE_AESGCM",
       "-DHAVE_HKDF",
       "-DWOLFSSL_SHA256",

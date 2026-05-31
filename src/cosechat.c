@@ -8,19 +8,18 @@
 #include <wolfssl/wolfcrypt/dilithium.h>
 #include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/kdf.h>
-#include <wolfssl/wolfcrypt/kyber.h>
+#include <wolfssl/wolfcrypt/wc_mlkem.h>
 #include <wolfssl/wolfcrypt/misc.h>
 #include <wolfssl/wolfcrypt/sha256.h>
-
-/* Scratch sizes: sign/verify needs room for full Sig_structure (~payload size);
- * encrypt/decrypt only needs room for Enc_structure header framing. */
-#define CC_SIGN_SCRATCH_SZ 3072
-#define CC_ENC_SCRATCH_SZ 512
 
 /* Intermediate buffer sizes (used as statics to stay off the stack) */
 #define CC_ANN_PAYLOAD_SZ \
   (CC_SIGN_PUBKEY_SZ + CC_KEM_PUBKEY_SZ + CC_MAX_NAME_LEN + CC_MAX_META_SZ + 32)
 #define CC_SIGN1_SZ (CC_ANN_PAYLOAD_SZ + CC_SIGN_SIG_SZ + 128)
+
+/* Scratch: wolfCOSE puts Sig_structure then signature back-to-back in scratch */
+#define CC_SIGN_SCRATCH_SZ (CC_ANN_PAYLOAD_SZ + CC_SIGN_SIG_SZ + 256)
+#define CC_ENC_SCRATCH_SZ 512
 #define CC_CHAT_PT_SZ (CC_ADDR_SZ + CC_MAX_MSG_SZ + 8)
 #define CC_ENC0_SZ (CC_CHAT_PT_SZ + 80)
 
@@ -377,15 +376,17 @@ int cc_key_generate(cc_key_t* key, WC_RNG* rng) {
 }
 
 int cc_key_import(cc_key_t* key, const uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ],
+                  const uint8_t sign_pub[CC_SIGN_PUBKEY_SZ],
                   const uint8_t kem_priv[CC_KEM_PRIVKEY_SZ]) {
   int ret;
-  if (!key || !sign_priv || !kem_priv)
+  if (!key || !sign_priv || !sign_pub || !kem_priv)
     return CC_E_ARG;
   wc_dilithium_init(&key->sign);
   ret = wc_dilithium_set_level(&key->sign, CC_SIGN_LEVEL);
   if (ret != 0)
     return CC_E_CRYPTO;
-  ret = wc_dilithium_import_private(sign_priv, CC_SIGN_PRIVKEY_SZ, &key->sign);
+  ret = wc_dilithium_import_key(sign_priv, CC_SIGN_PRIVKEY_SZ,
+                                sign_pub, CC_SIGN_PUBKEY_SZ, &key->sign);
   if (ret != 0)
     return CC_E_CRYPTO;
   ret = wc_KyberKey_Init(CC_KEM_TYPE, &key->kem, NULL, INVALID_DEVID);
@@ -407,7 +408,7 @@ int cc_key_export_private(const cc_key_t* key,
   if (ret != 0)
     return CC_E_CRYPTO;
   sz = CC_KEM_PRIVKEY_SZ;
-  ret = wc_KyberKey_EncodePrivateKey((KyberKey*)&key->kem, kem_priv, &sz);
+  ret = wc_KyberKey_EncodePrivateKey((KyberKey*)&key->kem, kem_priv, sz);
   return (ret == 0) ? CC_OK : CC_E_CRYPTO;
 }
 
@@ -423,7 +424,7 @@ int cc_key_export_public(const cc_key_t* key,
   if (ret != 0)
     return CC_E_CRYPTO;
   sz = CC_KEM_PUBKEY_SZ;
-  ret = wc_KyberKey_EncodePublicKey((KyberKey*)&key->kem, kem_pub, &sz);
+  ret = wc_KyberKey_EncodePublicKey((KyberKey*)&key->kem, kem_pub, sz);
   return (ret == 0) ? CC_OK : CC_E_CRYPTO;
 }
 
@@ -481,7 +482,7 @@ int cc_announce_build(const cc_key_t* key, const char* name, size_t name_len,
   if (ret != 0)
     return CC_E_CRYPTO;
   sz = CC_KEM_PUBKEY_SZ;
-  ret = wc_KyberKey_EncodePublicKey((KyberKey*)&key->kem, kem_pub, &sz);
+  ret = wc_KyberKey_EncodePublicKey((KyberKey*)&key->kem, kem_pub, sz);
   if (ret != 0)
     return CC_E_CRYPTO;
 
@@ -637,15 +638,17 @@ int cc_chat_build(const cc_key_t* sender_key,
 
   wc_CoseKey_Init(&cose_sym);
   ret = wc_CoseKey_SetSymmetric(&cose_sym, aes_key, 32);
-  wc_ForceZero(aes_key, 32);
-  if (ret != WOLFCOSE_SUCCESS)
+  if (ret != WOLFCOSE_SUCCESS) {
+    wc_ForceZero(aes_key, 32);
     return CC_E_CRYPTO;
+  }
 
   ret = wc_CoseEncrypt0_Encrypt(&cose_sym, WOLFCOSE_ALG_A256GCM, iv, sizeof(iv),
                                 payload_buf, payload_len, NULL, 0, NULL, NULL,
                                 0, scratch, sizeof(scratch), enc0_buf,
                                 sizeof(enc0_buf), &enc0_len);
   wc_CoseKey_Free(&cose_sym);
+  wc_ForceZero(aes_key, 32);
   if (ret != WOLFCOSE_SUCCESS)
     return CC_E_CRYPTO;
 
@@ -698,14 +701,16 @@ int cc_chat_parse(const cc_key_t* my_key, const uint8_t* in, size_t in_sz,
 
   wc_CoseKey_Init(&cose_sym);
   ret = wc_CoseKey_SetSymmetric(&cose_sym, aes_key, 32);
-  wc_ForceZero(aes_key, 32);
-  if (ret != WOLFCOSE_SUCCESS)
+  if (ret != WOLFCOSE_SUCCESS) {
+    wc_ForceZero(aes_key, 32);
     return CC_E_CRYPTO;
+  }
 
   ret = wc_CoseEncrypt0_Decrypt(&cose_sym, enc0, enc0_len, NULL, 0, NULL, 0,
                                 scratch, sizeof(scratch), &hdr, plaintext,
                                 sizeof(plaintext), &pt_len);
   wc_CoseKey_Free(&cose_sym);
+  wc_ForceZero(aes_key, 32);
   if (ret != WOLFCOSE_SUCCESS)
     return CC_E_DECRYPT;
 
