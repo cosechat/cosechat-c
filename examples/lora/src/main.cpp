@@ -354,6 +354,14 @@ static bool fragFeed(const uint8_t* data, uint8_t len) {
 // Announce broadcast
 // ---------------------------------------------------------------------------
 static void broadcastAnnounce() {
+    // A cosechat announce is ~5 KB and must be sent as ~21 LoRa fragments.
+    // If two nodes transmit simultaneously their fragments interleave by msg_id,
+    // causing both reassemblies to fail. A random pre-transmit delay (0–5 s)
+    // spreads simultaneous boots and periodic re-announces across time so
+    // collisions are rare. For a production mesh you would replace this with
+    // proper TDMA slot assignment or carrier-sense backoff.
+    vTaskDelay(pdMS_TO_TICKS(random(0, 5000)));
+
     size_t len = 0;
     // cc_announce_build blocks ~50ms (PoW difficulty=1 on ESP32)
     int ret = cc_announce_build(&myKey, "cc-node", 7, nullptr, 0,
