@@ -12,8 +12,8 @@
 #endif
 #include <wolfcose/wolfcose.h>
 #include <wolfssl/wolfcrypt/dilithium.h>
-#include <wolfssl/wolfcrypt/wc_mlkem.h>
 #include <wolfssl/wolfcrypt/random.h>
+#include <wolfssl/wolfcrypt/wc_mlkem.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,8 +41,8 @@ extern "C" {
 #define CC_MAX_NAME_LEN 63
 #define CC_MAX_META_SZ 256
 #define CC_MAX_MSG_SZ 512
-#define CC_PRES_BUF_SZ     128   /* max presence wire packet */
-#define CC_KEY_REQ_BUF_SZ  32    /* max key-request wire packet */
+#define CC_PRES_BUF_SZ 128   /* max presence wire packet */
+#define CC_KEY_REQ_BUF_SZ 32 /* max key-request wire packet */
 
 #ifndef CC_POW_DIFFICULTY
 #define CC_POW_DIFFICULTY 2
@@ -51,7 +51,7 @@ extern "C" {
 #define CC_MSG_ANNOUNCE 0
 #define CC_MSG_CHAT 1
 #define CC_MSG_PRESENCE 2
-#define CC_MSG_KEY_REQ  3
+#define CC_MSG_KEY_REQ 3
 
 #define CC_OK 0
 #define CC_E_ARG (-1)
@@ -96,8 +96,8 @@ typedef struct {
  */
 typedef struct {
   uint8_t addr[CC_ADDR_SZ];
-  char    name[CC_MAX_NAME_LEN + 1];
-  size_t  name_len;
+  char name[CC_MAX_NAME_LEN + 1];
+  size_t name_len;
   uint8_t hops;
 } cc_presence_t;
 
@@ -139,8 +139,9 @@ int cc_addr_from_key(const cc_key_t* key, uint8_t addr[CC_ADDR_SZ]);
  *   Key = HKDF-SHA256(ML-KEM-512 shared secret, info="cosechat")
  *
  * Presence: [type=2, hops, pow_nonce, addr_bstr(16), name_tstr]
- *   PoW: SHA-256(type_byte || addr || name || nonce_le32)[0:CC_POW_DIFFICULTY]==0
- *   No signature — addr authenticity established by CC_MSG_ANNOUNCE.
+ *   PoW: SHA-256(type_byte || addr || name ||
+ * nonce_le32)[0:CC_POW_DIFFICULTY]==0 No signature — addr authenticity
+ * established by CC_MSG_ANNOUNCE.
  *
  * KeyReq: [type=3, hops, addr_bstr(16)]
  *   No PoW. Target responds with its CC_MSG_ANNOUNCE.
@@ -165,12 +166,13 @@ int cc_chat_parse(const cc_key_t* my_key, const uint8_t* in, size_t in_sz,
 
 /* Presence — lightweight periodic heartbeat (~1 LoRa fragment, no signature) */
 int cc_presence_build(const cc_key_t* key, const char* name, size_t name_len,
-                      uint8_t* out, size_t out_sz, size_t* out_len, WC_RNG* rng);
+                      uint8_t* out, size_t out_sz, size_t* out_len,
+                      WC_RNG* rng);
 int cc_presence_parse(const uint8_t* in, size_t in_sz, cc_presence_t* p);
 
 /* Key request — ask a node to re-send its full announce */
-int cc_key_req_build(const uint8_t addr[CC_ADDR_SZ],
-                     uint8_t* out, size_t out_sz, size_t* out_len);
+int cc_key_req_build(const uint8_t addr[CC_ADDR_SZ], uint8_t* out,
+                     size_t out_sz, size_t* out_len);
 int cc_key_req_parse(const uint8_t* in, size_t in_sz, uint8_t addr[CC_ADDR_SZ]);
 
 /* Routing helpers */
