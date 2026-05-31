@@ -1,0 +1,3 @@
+[submodule "vendor/wolfCOSE"]
+	path = vendor/wolfCOSE
+	url = git@github.com:konsumer/wolfCOSE.git
