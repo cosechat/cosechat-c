@@ -186,6 +186,78 @@ static int dec_chat(const uint8_t* buf, size_t sz, uint8_t* hops,
   return CC_OK;
 }
 
+static int enc_presence(uint8_t* buf, size_t sz, size_t* len, uint8_t hops,
+                        uint32_t nonce, const uint8_t* addr,
+                        const char* name, size_t name_len) {
+  WOLFCOSE_CBOR_CTX c;
+  cbor_enc_init(&c, buf, sz);
+  if (wc_CBOR_EncodeArrayStart(&c, 5) != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeUint(&c, CC_MSG_PRESENCE)  != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeUint(&c, hops)             != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeUint(&c, nonce)            != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeBstr(&c, addr, CC_ADDR_SZ) != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeTstr(&c, (const uint8_t*)name, name_len) != WOLFCOSE_SUCCESS)
+    return CC_E_BUF;
+  *len = c.idx;
+  return CC_OK;
+}
+
+static int dec_presence(const uint8_t* buf, size_t sz, uint8_t* hops,
+                        uint32_t* nonce, const uint8_t** addr, size_t* addr_len,
+                        const uint8_t** name, size_t* name_len) {
+  WOLFCOSE_CBOR_CTX c;
+  size_t count;
+  uint64_t val;
+  cbor_dec_init(&c, buf, sz);
+  if (wc_CBOR_DecodeArrayStart(&c, &count) != WOLFCOSE_SUCCESS || count != 5)
+    return CC_E_FORMAT;
+  if (wc_CBOR_DecodeUint(&c, &val) != WOLFCOSE_SUCCESS || val != CC_MSG_PRESENCE)
+    return CC_E_FORMAT;
+  if (wc_CBOR_DecodeUint(&c, &val) != WOLFCOSE_SUCCESS) return CC_E_FORMAT;
+  *hops = (uint8_t)(val & 0xFF);
+  if (wc_CBOR_DecodeUint(&c, &val) != WOLFCOSE_SUCCESS) return CC_E_FORMAT;
+  *nonce = (uint32_t)(val & 0xFFFFFFFF);
+  if (wc_CBOR_DecodeBstr(&c, addr, addr_len) != WOLFCOSE_SUCCESS ||
+      *addr_len != CC_ADDR_SZ)
+    return CC_E_FORMAT;
+  if (wc_CBOR_DecodeTstr(&c, name, name_len) != WOLFCOSE_SUCCESS)
+    return CC_E_FORMAT;
+  return CC_OK;
+}
+
+static int enc_key_req(uint8_t* buf, size_t sz, size_t* len, uint8_t hops,
+                       const uint8_t addr[CC_ADDR_SZ]) {
+  WOLFCOSE_CBOR_CTX c;
+  cbor_enc_init(&c, buf, sz);
+  if (wc_CBOR_EncodeArrayStart(&c, 3) != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeUint(&c, CC_MSG_KEY_REQ)   != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeUint(&c, hops)             != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  if (wc_CBOR_EncodeBstr(&c, addr, CC_ADDR_SZ) != WOLFCOSE_SUCCESS) return CC_E_BUF;
+  *len = c.idx;
+  return CC_OK;
+}
+
+static int dec_key_req(const uint8_t* buf, size_t sz, uint8_t* hops,
+                       uint8_t addr[CC_ADDR_SZ]) {
+  WOLFCOSE_CBOR_CTX c;
+  size_t count;
+  uint64_t val;
+  const uint8_t* tmp;
+  size_t tmp_len;
+  cbor_dec_init(&c, buf, sz);
+  if (wc_CBOR_DecodeArrayStart(&c, &count) != WOLFCOSE_SUCCESS || count != 3)
+    return CC_E_FORMAT;
+  if (wc_CBOR_DecodeUint(&c, &val) != WOLFCOSE_SUCCESS || val != CC_MSG_KEY_REQ)
+    return CC_E_FORMAT;
+  if (wc_CBOR_DecodeUint(&c, &val) != WOLFCOSE_SUCCESS) return CC_E_FORMAT;
+  *hops = (uint8_t)(val & 0xFF);
+  if (wc_CBOR_DecodeBstr(&c, &tmp, &tmp_len) != WOLFCOSE_SUCCESS ||
+      tmp_len != CC_ADDR_SZ)
+    return CC_E_FORMAT;
+  memcpy(addr, tmp, CC_ADDR_SZ);
+  return CC_OK;
+}
+
 /* ---- Announce payload encode/decode ---- */
 
 static int enc_ann_payload(uint8_t* buf, size_t sz, size_t* len,
@@ -719,6 +791,61 @@ int cc_chat_parse(const cc_key_t* my_key, const uint8_t* in, size_t in_sz,
   return ret;
 }
 
+int cc_presence_build(const cc_key_t* key, const char* name, size_t name_len,
+                      uint8_t* out, size_t out_sz, size_t* out_len, WC_RNG* rng) {
+  uint8_t addr[CC_ADDR_SZ];
+  uint32_t nonce = 0;
+  int ret;
+  if (!key || !out || !out_len || !rng) return CC_E_ARG;
+  if (name_len > CC_MAX_NAME_LEN) return CC_E_ARG;
+  ret = cc_addr_from_key(key, addr);
+  if (ret != CC_OK) return ret;
+  ret = pow_find(CC_MSG_PRESENCE, addr, CC_ADDR_SZ,
+                 (const uint8_t*)(name ? name : ""), name ? name_len : 0,
+                 NULL, 0, &nonce);
+  if (ret != CC_OK) return ret;
+  return enc_presence(out, out_sz, out_len, 0, nonce, addr,
+                      name ? name : "", name ? name_len : 0);
+}
+
+int cc_presence_parse(const uint8_t* in, size_t in_sz, cc_presence_t* p) {
+  uint8_t hops;
+  uint32_t nonce;
+  const uint8_t* addr;
+  size_t addr_len;
+  const uint8_t* name;
+  size_t name_len;
+  uint8_t hash[32];
+  int ret;
+  if (!in || !p) return CC_E_ARG;
+  memset(p, 0, sizeof(*p));
+  ret = dec_presence(in, in_sz, &hops, &nonce, &addr, &addr_len, &name, &name_len);
+  if (ret != CC_OK) return ret;
+  ret = pow_hash(CC_MSG_PRESENCE, addr, CC_ADDR_SZ, name, name_len, NULL, 0,
+                 nonce, hash);
+  if (ret != CC_OK) return ret;
+  if (pow_check(hash) != CC_OK) return CC_E_POW;
+  memcpy(p->addr, addr, CC_ADDR_SZ);
+  if (name_len > CC_MAX_NAME_LEN) name_len = CC_MAX_NAME_LEN;
+  memcpy(p->name, name, name_len);
+  p->name[name_len] = '\0';
+  p->name_len = name_len;
+  p->hops = hops;
+  return CC_OK;
+}
+
+int cc_key_req_build(const uint8_t addr[CC_ADDR_SZ],
+                     uint8_t* out, size_t out_sz, size_t* out_len) {
+  if (!addr || !out || !out_len) return CC_E_ARG;
+  return enc_key_req(out, out_sz, out_len, 0, addr);
+}
+
+int cc_key_req_parse(const uint8_t* in, size_t in_sz, uint8_t addr[CC_ADDR_SZ]) {
+  uint8_t hops;
+  if (!in || !addr) return CC_E_ARG;
+  return dec_key_req(in, in_sz, &hops, addr);
+}
+
 int cc_msg_type(const uint8_t* pkt, size_t pkt_sz, uint8_t* type_out) {
   WOLFCOSE_CBOR_CTX c;
   size_t count;
@@ -821,6 +948,27 @@ int cc_hops_increment(const uint8_t* in, size_t in_sz, uint8_t* out,
     return enc_chat(out, out_sz, out_len, (uint8_t)(hops + 1), recip, kem_ct,
                     nonce, enc0, enc0_len);
   }
+  if (type == CC_MSG_PRESENCE) {
+    uint8_t hops;
+    uint32_t nonce;
+    const uint8_t* addr;
+    size_t addr_len;
+    const uint8_t* name;
+    size_t name_len;
+    ret = dec_presence(in, in_sz, &hops, &nonce, &addr, &addr_len, &name, &name_len);
+    if (ret != CC_OK) return ret;
+    if (hops == 255) return CC_E_ARG;
+    return enc_presence(out, out_sz, out_len, (uint8_t)(hops + 1), nonce, addr,
+                        (const char*)name, name_len);
+  }
+  if (type == CC_MSG_KEY_REQ) {
+    uint8_t hops;
+    uint8_t req_addr[CC_ADDR_SZ];
+    ret = dec_key_req(in, in_sz, &hops, req_addr);
+    if (ret != CC_OK) return ret;
+    if (hops == 255) return CC_E_ARG;
+    return enc_key_req(out, out_sz, out_len, (uint8_t)(hops + 1), req_addr);
+  }
   return CC_E_FORMAT;
 }
 
@@ -864,6 +1012,20 @@ int cc_pow_verify(const uint8_t* pkt, size_t pkt_sz) {
                    enc0_len, nonce, hash);
     if (ret != CC_OK)
       return ret;
+    return pow_check(hash);
+  }
+  if (type == CC_MSG_PRESENCE) {
+    uint8_t hops;
+    uint32_t nonce;
+    const uint8_t* addr;
+    size_t addr_len;
+    const uint8_t* name;
+    size_t name_len;
+    ret = dec_presence(pkt, pkt_sz, &hops, &nonce, &addr, &addr_len, &name, &name_len);
+    if (ret != CC_OK) return ret;
+    ret = pow_hash(CC_MSG_PRESENCE, addr, CC_ADDR_SZ, name, name_len, NULL, 0,
+                   nonce, hash);
+    if (ret != CC_OK) return ret;
     return pow_check(hash);
   }
   return CC_E_FORMAT;

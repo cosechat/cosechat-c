@@ -41,6 +41,8 @@ extern "C" {
 #define CC_MAX_NAME_LEN 63
 #define CC_MAX_META_SZ 256
 #define CC_MAX_MSG_SZ 512
+#define CC_PRES_BUF_SZ     128   /* max presence wire packet */
+#define CC_KEY_REQ_BUF_SZ  32    /* max key-request wire packet */
 
 #ifndef CC_POW_DIFFICULTY
 #define CC_POW_DIFFICULTY 2
@@ -48,6 +50,8 @@ extern "C" {
 
 #define CC_MSG_ANNOUNCE 0
 #define CC_MSG_CHAT 1
+#define CC_MSG_PRESENCE 2
+#define CC_MSG_KEY_REQ  3
 
 #define CC_OK 0
 #define CC_E_ARG (-1)
@@ -83,6 +87,19 @@ typedef struct {
   size_t meta_len;
   uint8_t hops;
 } cc_announce_t;
+
+/*
+ * cc_presence_t is ~80 bytes — safe on stack.
+ * Sent periodically instead of full announce; ~1 LoRa fragment.
+ * No signature: addr authenticity is proven by cc_announce.
+ * Receivers who lack the key for this addr send CC_MSG_KEY_REQ.
+ */
+typedef struct {
+  uint8_t addr[CC_ADDR_SZ];
+  char    name[CC_MAX_NAME_LEN + 1];
+  size_t  name_len;
+  uint8_t hops;
+} cc_presence_t;
 
 typedef struct {
   uint8_t sender_addr[CC_ADDR_SZ];
@@ -121,6 +138,13 @@ int cc_addr_from_key(const cc_key_t* key, uint8_t addr[CC_ADDR_SZ]);
  *   COSE_Encrypt0 plaintext: [sender_addr_bstr(16), message_bstr]
  *   Key = HKDF-SHA256(ML-KEM-512 shared secret, info="cosechat")
  *
+ * Presence: [type=2, hops, pow_nonce, addr_bstr(16), name_tstr]
+ *   PoW: SHA-256(type_byte || addr || name || nonce_le32)[0:CC_POW_DIFFICULTY]==0
+ *   No signature — addr authenticity established by CC_MSG_ANNOUNCE.
+ *
+ * KeyReq: [type=3, hops, addr_bstr(16)]
+ *   No PoW. Target responds with its CC_MSG_ANNOUNCE.
+ *
  * PoW: SHA-256(type_byte || core_payload || nonce_le32)[0:CC_POW_DIFFICULTY]==0
  *   Announce core = sign1_bytes
  *   Chat core     = recipient_addr || kem_ct || encrypt0_bytes
@@ -138,6 +162,16 @@ int cc_chat_build(const cc_key_t* sender_key,
                   size_t out_sz, size_t* out_len, WC_RNG* rng);
 int cc_chat_parse(const cc_key_t* my_key, const uint8_t* in, size_t in_sz,
                   cc_chat_t* chat);
+
+/* Presence — lightweight periodic heartbeat (~1 LoRa fragment, no signature) */
+int cc_presence_build(const cc_key_t* key, const char* name, size_t name_len,
+                      uint8_t* out, size_t out_sz, size_t* out_len, WC_RNG* rng);
+int cc_presence_parse(const uint8_t* in, size_t in_sz, cc_presence_t* p);
+
+/* Key request — ask a node to re-send its full announce */
+int cc_key_req_build(const uint8_t addr[CC_ADDR_SZ],
+                     uint8_t* out, size_t out_sz, size_t* out_len);
+int cc_key_req_parse(const uint8_t* in, size_t in_sz, uint8_t addr[CC_ADDR_SZ]);
 
 /* Routing helpers */
 int cc_msg_type(const uint8_t* pkt, size_t pkt_sz, uint8_t* type_out);

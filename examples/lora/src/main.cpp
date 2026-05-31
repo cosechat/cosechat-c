@@ -43,6 +43,8 @@ extern "C" {
 
 #define ANN_BUF_SZ   6144
 #define CHAT_BUF_SZ  2048
+#define PRES_BUF_SZ  128
+#define KEY_REQ_BUF_SZ 32
 
 #define SD_CS        12
 #define KEY_FILE     "/cc/key.bin"
@@ -84,6 +86,8 @@ static uint8_t myAddr[CC_ADDR_SZ];
 // ---------------------------------------------------------------------------
 static uint8_t annBuf[ANN_BUF_SZ];
 static uint8_t chatBuf[CHAT_BUF_SZ];
+static uint8_t presBuf[PRES_BUF_SZ];
+static uint8_t keyReqBuf[KEY_REQ_BUF_SZ];
 
 // ---------------------------------------------------------------------------
 // Fragment reassembly (single slot — only one message being assembled)
@@ -377,6 +381,22 @@ static void broadcastAnnounce() {
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast presence (periodic heartbeat, ~1 LoRa fragment)
+// ---------------------------------------------------------------------------
+static void broadcastPresence() {
+    size_t len = 0;
+    int ret = cc_presence_build(&myKey, "cc-node", 7,
+                                presBuf, sizeof(presBuf), &len, &rng);
+    if (ret == CC_OK && len > 0) {
+        TxJob job;
+        memcpy(job.data, presBuf, len);
+        job.len = (uint8_t)len;
+        xQueueSend(txQ, &job, pdMS_TO_TICKS(1000));
+        logMsg("TX", "presence", CYAN);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process a fully reassembled cosechat packet
 // ---------------------------------------------------------------------------
 static void processPkt(const uint8_t* pkt, size_t len, float rssi, float snr) {
@@ -385,18 +405,52 @@ static void processPkt(const uint8_t* pkt, size_t len, float rssi, float snr) {
 
     if (type == CC_MSG_ANNOUNCE) {
         if (cc_announce_parse(pkt, len, &tmpAnn) == CC_OK) {
-            // Ignore our own announces
             if (memcmp(tmpAnn.addr, myAddr, CC_ADDR_SZ) == 0) return;
             peerAddOrUpdate(&tmpAnn);
             char buf[CC_MAX_NAME_LEN + 24];
-            snprintf(buf, sizeof(buf), "'%s' %.0fdBm", tmpAnn.name, rssi);
+            snprintf(buf, sizeof(buf), "'%s' %.0fdBm (key)", tmpAnn.name, rssi);
             logMsg("ANN", buf, GREEN);
             drawStatus();
         }
+
+    } else if (type == CC_MSG_PRESENCE) {
+        cc_presence_t pres;
+        if (cc_presence_parse(pkt, len, &pres) != CC_OK) return;
+        if (memcmp(pres.addr, myAddr, CC_ADDR_SZ) == 0) return;
+
+        char buf[CC_MAX_NAME_LEN + 24];
+        snprintf(buf, sizeof(buf), "'%s' %.0fdBm", pres.name, rssi);
+        logMsg("PRE", buf, ORANGE);
+
+        // Unknown peer? request their full announce
+        bool known = false;
+        for (int i = 0; i < peerCount; i++) {
+            if (memcmp(peerAddrs[i], pres.addr, CC_ADDR_SZ) == 0) {
+                known = true; break;
+            }
+        }
+        if (!known) {
+            size_t rlen = 0;
+            if (cc_key_req_build(pres.addr, keyReqBuf, sizeof(keyReqBuf), &rlen) == CC_OK) {
+                TxJob job;
+                memcpy(job.data, keyReqBuf, rlen);
+                job.len = (uint8_t)rlen;
+                xQueueSend(txQ, &job, pdMS_TO_TICKS(1000));
+                logMsg("TX", "key_req", CYAN);
+            }
+        }
+
+    } else if (type == CC_MSG_KEY_REQ) {
+        uint8_t reqAddr[CC_ADDR_SZ];
+        if (cc_key_req_parse(pkt, len, reqAddr) != CC_OK) return;
+        if (memcmp(reqAddr, myAddr, CC_ADDR_SZ) != 0) return;
+        logMsg("RX", "key_req (sending announce)", ORANGE);
+        broadcastAnnounce();
+
     } else if (type == CC_MSG_CHAT) {
         uint8_t recip[CC_ADDR_SZ];
         if (cc_msg_recipient(pkt, len, recip) != CC_OK) return;
-        if (memcmp(recip, myAddr, CC_ADDR_SZ) != 0) return;  // not for us
+        if (memcmp(recip, myAddr, CC_ADDR_SZ) != 0) return;
         if (cc_chat_parse(&myKey, pkt, len, &tmpChat) == CC_OK) {
             char sender[9];
             toHex(tmpChat.sender_addr, 4, sender);
@@ -647,7 +701,7 @@ void setup() {
     drawStatus();
     drawInput();
 
-    // Announce immediately
+    // Announce at boot (proves identity); presence sent periodically after
     broadcastAnnounce();
     lastAnn = millis();
 }
@@ -661,7 +715,7 @@ void loop() {
     pumpRx();
 
     if (millis() - lastAnn >= ANNOUNCE_MS) {
-        broadcastAnnounce();
+        broadcastPresence();
         lastAnn = millis();
     }
 
