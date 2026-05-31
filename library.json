@@ -18,17 +18,19 @@
     "includeDir": "include",
     "flags": [
       "-DHAVE_DILITHIUM",
-      "-DWOLFSSL_DILITHIUM_FIPS_204",
-      "-DWOLFSSL_HAVE_KYBER",
-      "-DWOLFSSL_KYBER512",
+      "-DWOLFSSL_WC_DILITHIUM",
+      "-DWOLFSSL_HAVE_MLKEM",
+      "-DWOLFSSL_WC_MLKEM",
       "-DHAVE_AESGCM",
       "-DHAVE_HKDF",
       "-DWOLFSSL_SHA256",
+      "-DWOLFSSL_SHA3",
+      "-DHAVE_SHAKE256",
       "-DWOLFSSL_KEY_GEN"
     ]
   },
   "dependencies": {
     "wolfssl": ">=5.0.0",
-    "wolfcose": "https://github.com/aidangarske/wolfCOSE"
+    "wolfcose": "https://github.com/konsumer/wolfCOSE.git#124ee3c"
   }
 }

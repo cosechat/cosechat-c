@@ -52,7 +52,7 @@ Add to `platformio.ini`:
 lib_deps =
   wolfssl
   https://github.com/aidangarske/wolfCOSE
-  # this library
+  https://github.com/konsumer/cosechat-c
 ```
 
 Required build flags (see `library.json`):
