@@ -212,18 +212,24 @@ static void test_key_req(void) {
   cc_addr_from_key(&key, addr);
   printf("key_req:\n");
 
-  T("build",   cc_key_req_build(addr, pkt, sizeof(pkt), &pkt_len) == CC_OK);
+  T("build",    cc_key_req_build(addr, pkt, sizeof(pkt), &pkt_len) == CC_OK);
   T("nonempty", pkt_len > 0 && pkt_len <= KEY_REQ_BUF_SZ);
   cc_msg_type(pkt, pkt_len, &type);
   T("msg_type", type == CC_MSG_KEY_REQ);
-  T("parse",   cc_key_req_parse(pkt, pkt_len, parsed_addr) == CC_OK);
+  T("parse",    cc_key_req_parse(pkt, pkt_len, parsed_addr) == CC_OK);
   T("addr_match", memcmp(addr, parsed_addr, CC_ADDR_SZ) == 0);
+  T("pow_ok",   cc_pow_verify(pkt, pkt_len) == CC_OK);
 
   T("hops_inc", cc_hops_increment(pkt, pkt_len, pkt2, sizeof(pkt2), &pkt2_len) == CC_OK);
   cc_msg_hops(pkt2, pkt2_len, &hops);
   T("hops_value", hops == 1);
   T("parse_after_hop", cc_key_req_parse(pkt2, pkt2_len, parsed_addr) == CC_OK);
   T("addr_after_hop",  memcmp(addr, parsed_addr, CC_ADDR_SZ) == 0);
+  T("pow_after_hop",   cc_pow_verify(pkt2, pkt2_len) == CC_OK);
+
+  /* Corrupt nonce → PoW fails */
+  pkt[pkt_len - 1] ^= 0xFF;
+  T("corrupt_rejected", cc_key_req_parse(pkt, pkt_len, parsed_addr) != CC_OK);
 
   T("null_arg", cc_key_req_build(NULL, pkt, sizeof(pkt), &pkt_len) == CC_E_ARG);
   cc_key_free(&key);

@@ -53,6 +53,10 @@ extern "C" {
 #define MAX_PEERS    16
 #define STATUS_H     16
 #define ANNOUNCE_MS  60000UL
+// Client-side hop limit. The protocol does not enforce this; each node decides
+// independently. Packets above this hop count are silently dropped rather than
+// forwarded, preventing indefinite circulation in routing loops.
+#define CC_MAX_HOPS  15
 
 // ---------------------------------------------------------------------------
 // Hardware
@@ -402,6 +406,9 @@ static void broadcastPresence() {
 static void processPkt(const uint8_t* pkt, size_t len, float rssi, float snr) {
     uint8_t type = 0;
     if (cc_msg_type(pkt, len, &type) != CC_OK) return;
+    uint8_t hops = 0;
+    cc_msg_hops(pkt, len, &hops);
+    if (hops > CC_MAX_HOPS) return;  // drop; don't forward stale packets
 
     if (type == CC_MSG_ANNOUNCE) {
         if (cc_announce_parse(pkt, len, &tmpAnn) == CC_OK) {
