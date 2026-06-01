@@ -91,4 +91,4 @@ Targets: `espressif32` (Arduino, ESP-IDF).
 
 ## License
 
-[ZLIB](https://opensource.org/license/ZLIB)
+[Zlib](https://opensource.org/license/ZLIB)
