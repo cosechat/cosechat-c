@@ -74,6 +74,7 @@ Targets: `espressif32` (Arduino, ESP-IDF).
 - [`examples/keygen.c`](examples/keygen.c) — generate and export keys
 - [`examples/announce.c`](examples/announce.c) — build, parse, and route an announce
 - [`examples/chat.c`](examples/chat.c) — full Alice→Bob encrypted chat with hop routing
+- [`examples/lora`](examples/lora) — Complete example client for CardputerADV (similar should work for any ESP32.)
 - [`test/test_cosechat.c`](test/test_cosechat.c) — full test suite
 
 ## Error codes
