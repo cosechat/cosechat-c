@@ -11,6 +11,7 @@ Wire format is CBOR. Crypto is COSE. No dynamic allocation — safe for ESP32.
 - **Chat** — encrypted with ML-KEM-512 key encapsulation + AES-256-GCM (COSE_Encrypt0), sender address authenticated inside ciphertext
 - **Spam resistance** — SHA-256 proof-of-work on every packet, configurable difficulty (`CC_POW_DIFFICULTY`)
 - **Routing** — inspect type, hops, and recipient address without decrypting; increment hops in-place
+- **Roads** — pluggable transports (`road_lora`, `road_wifi`) that hand the application whole packets
 - **Embedded-safe** — large structs (`cc_key_t`, `cc_announce_t`) use static/global storage, no heap
 
 ## Message types
@@ -19,6 +20,8 @@ Wire format is CBOR. Crypto is COSE. No dynamic allocation — safe for ESP32.
 |------|-------|-------------|
 | `CC_MSG_ANNOUNCE` | 0 | Node identity broadcast |
 | `CC_MSG_CHAT` | 1 | Encrypted directed message |
+| `CC_MSG_PRESENCE` | 2 | Periodic unsigned heartbeat |
+| `CC_MSG_KEY_REQ` | 3 | Ask a node to re-send its full announce |
 
 ## Wire format
 
@@ -65,17 +68,74 @@ Required build flags (see `library.json`):
 
 Targets: `espressif32` (Arduino, ESP-IDF).
 
+**wolfSSL ≥ 5.8 is required** (`wolfssl/wolfcrypt/wc_mlkem.h` landed in 5.8).
+The PlatformIO registry package tops out at 5.7.2, so a registry-only
+`lib_deps = wolfssl` cannot provide ML-KEM — point at a wolfSSL ≥ 5.8 source
+(see [`examples/cardputer/fetch-wolfssl.sh`](examples/cardputer/fetch-wolfssl.sh)).
+
+## Roads (transports)
+
+A *road* moves whole cosechat packets between nodes. It owns framing, and
+fragmentation where the medium needs it, so the application only ever sees
+complete packets:
+
+```c
+extern cc_road_t* road;
+
+road->send(road, pkt, len);
+
+uint8_t buf[CC_ROAD_PKT_BUF_SZ];
+size_t len;
+while (road->recv(road, buf, sizeof(buf), &len) == CC_ROAD_OK) {
+  /* cc_msg_type() / cc_announce_parse() / cc_chat_parse() ... */
+}
+```
+
+| Road | Medium | Header | Source |
+|------|--------|--------|--------|
+| `road_lora` | SX1262 LoRa via [RadioLib](https://github.com/jgromes/RadioLib) | `include/road_lora.h` | `src/road_lora.cpp` |
+| `road_wifi` | WiFi + UDP (ESP32 Arduino) | `include/road_wifi.h` | `src/road_wifi.cpp` |
+
+Both share the framing in `include/road.h`: `[magic=0xCC, msg_id, frag_idx,
+frag_total, payload]`, 248-byte payloads, sized for the SX1262's 252-byte
+packet limit. Each road is compiled only when its dependency is available
+(`__has_include`), so the library stays buildable without RadioLib or the WiFi
+stack.
+
+```c
+static cc_road_lora_t lora;          /* ~16 KB — static/global */
+cc_road_lora_cfg_t cfg;
+cc_road_lora_defaults(&cfg);         /* CardputerADV + LoRa Cap 1262 */
+cfg.spi_mux = bus_mutex;             /* SD card shares the SPI bus */
+cfg.antenna = antenna_switch;        /* cap RF switch, if any */
+cc_road_lora_init(&lora, &cfg);
+cc_road_t* road = &lora.road;
+
+static cc_road_wifi_t wifi;
+cc_road_wifi_cfg_t wifi_cfg;
+cc_road_wifi_defaults(&wifi_cfg);    /* port 4242, broadcast */
+wifi_cfg.ssid = "my-ssid";
+wifi_cfg.pass = "my-pass";
+cc_road_wifi_init(&wifi, &wifi_cfg);
+```
+
+`road_lora` runs its own FreeRTOS task (RX except during TX); `road_wifi` has
+no task and drains the socket inside `recv()`.
+
 ## Embedded notes
 
-`cc_key_t` is ~13 KB. `cc_announce_t` is ~2.5 KB. Declare both **static or global** on ESP32 — never as stack locals. See examples for the pattern.
+`cc_key_t` is ~13 KB. `cc_announce_t` is ~2.5 KB, road structs ~16 KB. Declare
+all of them **static or global** on ESP32 — never as stack locals. See examples
+for the pattern.
 
 ## Examples & tests
 
 - [`examples/keygen.c`](examples/keygen.c) — generate and export keys
 - [`examples/announce.c`](examples/announce.c) — build, parse, and route an announce
 - [`examples/chat.c`](examples/chat.c) — full Alice→Bob encrypted chat with hop routing
-- [`examples/lora`](examples/lora) — Complete example client for CardputerADV (similar should work for any ESP32.)
-- [`test/test_cosechat.c`](test/test_cosechat.c) — full test suite
+- [`examples/cardputer`](examples/cardputer) — node firmware for CardputerADV (LoRa cap or WiFi/UDP)
+- [`test/test_cosechat.c`](test/test_cosechat.c) — protocol test suite
+- [`test/test_road.c`](test/test_road.c) — road framing (fragmentation/reassembly) tests
 
 ## Error codes
 

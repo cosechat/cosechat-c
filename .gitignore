@@ -1,3 +1,4 @@
 .DS_Store
 .settings.local.json
 build/
+examples/cardputer/lib/

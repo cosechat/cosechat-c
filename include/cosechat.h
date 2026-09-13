@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define CC_VERSION "0.2.0"
+#define CC_VERSION "0.3.0"
 
 /* Algorithm selection (change here to upgrade security level) */
 #define CC_SIGN_LEVEL 2 /* ML-DSA-44 (Dilithium level 2) */

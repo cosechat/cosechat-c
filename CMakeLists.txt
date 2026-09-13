@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cosechat VERSION 0.2.0 LANGUAGES C)
+project(cosechat VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -68,3 +68,9 @@ add_executable(test_cosechat test/test_cosechat.c)
 target_compile_definitions(test_cosechat PRIVATE CC_POW_DIFFICULTY=1)
 target_link_libraries(test_cosechat PRIVATE cosechat)
 add_test(NAME cosechat COMMAND test_cosechat)
+
+# Road framing is platform-independent (include/road.h), so it is tested on
+# the host rather than on hardware.
+add_executable(test_road test/test_road.c)
+target_link_libraries(test_road PRIVATE cosechat)
+add_test(NAME cosechat_road COMMAND test_road)
