@@ -1,8 +1,9 @@
-// cosechat demo node — CardputerADV, on a road (`road_lora` or `road_wifi`).
+// cosechat demo node — CardputerADV, on a road (`road_lora`, `road_wifi`,
+// `road_ble` or `road_80211`).
 //
-// Default road is LoRa (M5 LoRa Cap 1262). Build the `wifi` env for the
-// WiFi/UDP road instead; the rest of the node is identical because the road
-// hides framing and fragmentation.
+// Default road is LoRa (M5 LoRa Cap 1262); build one of the other PlatformIO
+// envs (wifi/ble/dot11) for a different road. The rest of the node is
+// identical because the road hides framing and fragmentation.
 //
 //   Tab   = cycle peers        Enter = send chat to selected peer
 //
@@ -25,7 +26,11 @@
 extern "C" {
 #include "cosechat.h"
 #include "road.h"
-#ifdef CC_ROAD_WIFI
+#if defined(CC_ROAD_BLE)
+#include "road_ble.h"
+#elif defined(CC_ROAD_80211)
+#include "road_80211.h"
+#elif defined(CC_ROAD_WIFI)
 #include "road_wifi.h"
 #else
 #include "road_lora.h"
@@ -59,9 +64,11 @@ extern "C" {
 // forwarded, preventing indefinite circulation in routing loops.
 #define CC_MAX_HOPS 15
 
-#ifndef CC_ROAD_WIFI
-static const char NODE_NAME[] = "cc-node";
-#else
+#if defined(CC_ROAD_BLE)
+static const char NODE_NAME[] = "cc-ble";
+#elif defined(CC_ROAD_80211)
+static const char NODE_NAME[] = "cc-raw";
+#elif defined(CC_ROAD_WIFI)
 static const char NODE_NAME[] = "cc-wifi";
 
 #ifndef WIFI_SSID
@@ -70,6 +77,8 @@ static const char NODE_NAME[] = "cc-wifi";
 #ifndef WIFI_PASS
 #define WIFI_PASS ""
 #endif
+#else
+static const char NODE_NAME[] = "cc-node";
 #endif
 
 // ---------------------------------------------------------------------------
@@ -81,10 +90,14 @@ M5Canvas canvas(&M5Cardputer.Display);
 // ---------------------------------------------------------------------------
 // Road
 // ---------------------------------------------------------------------------
-#ifndef CC_ROAD_WIFI
-static cc_road_lora_t roadImpl;
-#else
+#if defined(CC_ROAD_BLE)
+static cc_road_ble_t roadImpl;
+#elif defined(CC_ROAD_80211)
+static cc_road_80211_t roadImpl;
+#elif defined(CC_ROAD_WIFI)
 static cc_road_wifi_t roadImpl;
+#else
+static cc_road_lora_t roadImpl;
 #endif
 static cc_road_t* road = &roadImpl.road;
 
@@ -352,7 +365,7 @@ static void broadcastAnnounce() {
   // spreads simultaneous boots and periodic re-announces across time so
   // collisions are rare. For a production mesh you would replace this with
   // proper TDMA slot assignment or carrier-sense backoff.
-#ifndef CC_ROAD_WIFI
+#if !defined(CC_ROAD_BLE) && !defined(CC_ROAD_80211) && !defined(CC_ROAD_WIFI)
   delay(random(0, 5000));
 #endif
 
@@ -563,7 +576,21 @@ void setup() {
   canvas.setTextSize(1);
 
   // Road
-#ifndef CC_ROAD_WIFI
+#if defined(CC_ROAD_BLE)
+  cc_road_ble_cfg_t bleCfg;
+  cc_road_ble_defaults(&bleCfg);
+  int ret = cc_road_ble_init(&roadImpl, &bleCfg);
+#elif defined(CC_ROAD_80211)
+  cc_road_80211_cfg_t rawCfg;
+  cc_road_80211_defaults(&rawCfg);
+  int ret = cc_road_80211_init(&roadImpl, &rawCfg);
+#elif defined(CC_ROAD_WIFI)
+  cc_road_wifi_cfg_t wifiCfg;
+  cc_road_wifi_defaults(&wifiCfg);
+  wifiCfg.ssid = WIFI_SSID;
+  wifiCfg.pass = WIFI_PASS;
+  int ret = cc_road_wifi_init(&roadImpl, &wifiCfg);
+#else
   // I2C for the port expander that drives the cap's antenna switch
   m5::In_I2C.begin(I2C_NUM_0, 8, 9);
   if (ioe.begin()) {
@@ -584,12 +611,6 @@ void setup() {
     delay(2);
   };
   int ret = cc_road_lora_init(&roadImpl, &loraCfg);
-#else
-  cc_road_wifi_cfg_t wifiCfg;
-  cc_road_wifi_defaults(&wifiCfg);
-  wifiCfg.ssid = WIFI_SSID;
-  wifiCfg.pass = WIFI_PASS;
-  int ret = cc_road_wifi_init(&roadImpl, &wifiCfg);
 #endif
 
   if (ret != CC_ROAD_OK) {

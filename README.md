@@ -11,7 +11,7 @@ Wire format is CBOR. Crypto is COSE. No dynamic allocation — safe for ESP32.
 - **Chat** — encrypted with ML-KEM-512 key encapsulation + AES-256-GCM (COSE_Encrypt0), sender address authenticated inside ciphertext
 - **Spam resistance** — SHA-256 proof-of-work on every packet, configurable difficulty (`CC_POW_DIFFICULTY`)
 - **Routing** — inspect type, hops, and recipient address without decrypting; increment hops in-place
-- **Roads** — pluggable transports (`road_lora`, `road_wifi`) that hand the application whole packets
+- **Roads** — pluggable transports (`road_lora`, `road_wifi`, `road_ble`, `road_80211`) that hand the application whole packets
 - **Embedded-safe** — large structs (`cc_key_t`, `cc_announce_t`) use static/global storage, no heap
 
 ## Message types
@@ -95,12 +95,37 @@ while (road->recv(road, buf, sizeof(buf), &len) == CC_ROAD_OK) {
 |------|--------|--------|--------|
 | `road_lora` | SX1262 LoRa via [RadioLib](https://github.com/jgromes/RadioLib) | `include/road_lora.h` | `src/road_lora.cpp` |
 | `road_wifi` | WiFi + UDP (ESP32 Arduino) | `include/road_wifi.h` | `src/road_wifi.cpp` |
+| `road_ble` | Anonymous BLE 5 extended advertising via [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) | `include/road_ble.h` | `src/road_ble.cpp` |
+| `road_80211` | Unauthenticated 802.11 management frames (ESP32) | `include/road_80211.h` | `src/road_80211.cpp` |
 
-Both share the framing in `include/road.h`: `[magic=0xCC, msg_id, frag_idx,
-frag_total, payload]`, 248-byte payloads, sized for the SX1262's 252-byte
-packet limit. Each road is compiled only when its dependency is available
-(`__has_include`), so the library stays buildable without RadioLib or the WiFi
-stack.
+All four share the framing in `include/road.h`: `[magic=0xCC, msg_id, frag_idx,
+frag_total, payload]`, sized for the SX1262's 252-byte packet limit. A road
+with a smaller MTU passes its own fragment payload to the `*_n` helpers —
+`road_ble` uses 243 bytes so each fragment fits one extended advertisement.
+Each road is compiled only when its dependency is available (`__has_include`),
+so the library stays buildable without RadioLib, NimBLE or the WiFi stack.
+
+### Opportunistic roads
+
+`road_ble` and `road_80211` piggyback on radios a device already has, without
+joining anything:
+
+- **`road_ble`** carries each fragment as manufacturer-specific data in a
+  non-connectable, non-scannable, *anonymous* BLE 5 extended advertisement (no
+  advertiser address, no scan response, no connection). RX is a continuous
+  passive scan. One advertisement holds 251 bytes of data, minus the AD header,
+  company id and road header — 243 payload bytes, so an announce is ~22
+  advertisements. `send()` blocks while each fragment advertises
+  (`cfg.adv_ms`); the NimBLE host task does RX.
+- **`road_80211`** carries each fragment in a vendor-specific action frame
+  (category 127) sent to the broadcast MAC — a plain management frame that
+  needs no association, authentication or ACK. The source address is a random
+  locally-administered MAC. RX is promiscuous-mode capture, so both ends must
+  sit on the same channel (`cfg.channel`). The promiscuous callback runs in the
+  WiFi task and reassembles there.
+
+Both are lossy and unacknowledged, like any broadcast medium: announces are
+the expensive case (many fragments) and presence/chat are cheap.
 
 ```c
 static cc_road_lora_t lora;          /* ~16 KB — static/global */
@@ -117,10 +142,21 @@ cc_road_wifi_defaults(&wifi_cfg);    /* port 4242, broadcast */
 wifi_cfg.ssid = "my-ssid";
 wifi_cfg.pass = "my-pass";
 cc_road_wifi_init(&wifi, &wifi_cfg);
+
+static cc_road_ble_t ble;
+cc_road_ble_cfg_t ble_cfg;
+cc_road_ble_defaults(&ble_cfg);      /* 0 dBm, 20 ms interval, 120 ms/frag */
+cc_road_ble_init(&ble, &ble_cfg);
+
+static cc_road_80211_t raw;
+cc_road_80211_cfg_t raw_cfg;
+cc_road_80211_defaults(&raw_cfg);    /* channel 1 */
+cc_road_80211_init(&raw, &raw_cfg);
 ```
 
 `road_lora` runs its own FreeRTOS task (RX except during TX); `road_wifi` has
-no task and drains the socket inside `recv()`.
+no task and drains the socket inside `recv()`; `road_ble` and `road_80211`
+reassemble inside the NimBLE / WiFi task and hand `recv()` a queue.
 
 ## Embedded notes
 
@@ -133,7 +169,7 @@ for the pattern.
 - [`examples/keygen.c`](examples/keygen.c) — generate and export keys
 - [`examples/announce.c`](examples/announce.c) — build, parse, and route an announce
 - [`examples/chat.c`](examples/chat.c) — full Alice→Bob encrypted chat with hop routing
-- [`examples/cardputer`](examples/cardputer) — node firmware for CardputerADV (LoRa cap or WiFi/UDP)
+- [`examples/cardputer`](examples/cardputer) — node firmware for CardputerADV (LoRa cap, WiFi/UDP, anonymous BLE, or raw 802.11)
 - [`test/test_cosechat.c`](test/test_cosechat.c) — protocol test suite
 - [`test/test_road.c`](test/test_road.c) — road framing (fragmentation/reassembly) tests
 

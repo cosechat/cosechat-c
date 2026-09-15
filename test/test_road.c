@@ -152,6 +152,46 @@ static void test_interleave(void) {
   T("bytes identical", memcmp(f.buf, pkt, sizeof(pkt)) == 0);
 }
 
+/* A road whose MTU is smaller than the default payload (BLE advertising) uses
+ * the same framing with an explicit fragment payload. */
+static void test_generic_payload(void) {
+  static cc_road_frag_t f;
+  static uint8_t pkt[5000];
+  uint8_t frag[CC_ROAD_FRAG_HDR + CC_ROAD_FRAG_MAX_PAYLOAD];
+  const size_t payload = 243; /* CC_ROAD_BLE_FRAG_PAYLOAD */
+  size_t total, i, n;
+  int done = 0, bad_len = 0;
+
+  for (i = 0; i < sizeof(pkt); i++) pkt[i] = (uint8_t)(i * 31 + 5);
+  total = cc_road_frag_count_n(sizeof(pkt), payload);
+
+  printf("generic payload (243):\n");
+  T("count", total == (sizeof(pkt) + payload - 1) / payload);
+  T("zero payload rejected", cc_road_frag_count_n(sizeof(pkt), 0) == 0);
+  T("zero length", cc_road_frag_count_n(0, payload) == 0);
+
+  cc_road_frag_init(&f);
+  for (i = 0; i < total; i++) {
+    n = cc_road_frag_encode_n(pkt, sizeof(pkt), 3, (uint8_t)i, (uint8_t)total,
+                              payload, frag);
+    if (n <= CC_ROAD_FRAG_HDR || n > payload + CC_ROAD_FRAG_HDR)
+      bad_len = 1;
+    done = cc_road_frag_feed_n(&f, frag, n, payload);
+  }
+  T("fragment lengths bounded", !bad_len);
+  T("complete", done == 1);
+  T("length", f.len == sizeof(pkt));
+  T("bytes identical", memcmp(f.buf, pkt, sizeof(pkt)) == 0);
+
+  /* A fragment encoded for one MTU must not be accepted by another. */
+  cc_road_frag_init(&f);
+  n = cc_road_frag_encode(pkt, sizeof(pkt), 4, 0, 2, frag);
+  T("foreign MTU rejected", cc_road_frag_feed_n(&f, frag, n, payload) == -1);
+  cc_road_frag_init(&f);
+  n = cc_road_frag_encode_n(pkt, sizeof(pkt), 5, 0, 2, payload, frag);
+  T("own MTU accepted", cc_road_frag_feed_n(&f, frag, n, payload) == 0);
+}
+
 int main(void) {
   test_count();
   test_encode_rejects();
@@ -159,6 +199,7 @@ int main(void) {
   test_duplicates();
   test_rejects();
   test_interleave();
+  test_generic_payload();
   printf("\n%d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;
 }

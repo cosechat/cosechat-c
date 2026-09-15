@@ -2,3 +2,4 @@
 .settings.local.json
 build/
 examples/cardputer/lib/
+examples/cardputer/.pio/
