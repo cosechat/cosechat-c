@@ -11,14 +11,22 @@
  * connection, no bonding, no GAP address, no scan response. Receiving is a
  * continuous passive scan; any BLE 5 scanner in range sees the same bytes.
  *
+ * Anonymous by design means unattributable by design: with no advertiser
+ * address and no scan response there is nothing to record, so recv() always
+ * reports road->last_src_len == 0. A caller must treat that as "sender
+ * unknown" and must not fall back to the address the packet announces (see the
+ * contract on cc_road_t.last_src).
+ *
  * One advertisement carries at most CC_ROAD_BLE_FRAG_PAYLOAD fragment bytes
  * (the 251-byte extended-advertising data limit minus the AD and road
- * headers), so packets are split with the shared road framing (road.h). The
- * 5 KB announce is ~22 advertisements.
+ * headers), so packets are split with the shared road framing
+ * (cosechat_road.h). A full announce (name and metadata at their limits) is 21
+ * advertisements.
  *
  * send() blocks while each fragment advertises (cfg.adv_ms) because the
  * advertisement data must be swapped per fragment. The NimBLE host task does
- * RX and reassembly, so recv() only drains a queue and never blocks.
+ * RX and reassembly, so recv() only reads the completed-packet slot and never
+ * blocks.
  *
  * Requires NimBLE-Arduino >= 1.4 with extended advertising enabled:
  *
@@ -29,7 +37,7 @@
  * The struct embeds ~16 KB of buffers — declare it static/global.
  */
 
-#include "road.h"
+#include "cosechat_road.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,10 +51,10 @@ extern "C" {
   (CC_ROAD_BLE_ADV_MAX - 2 - 2 - CC_ROAD_FRAG_HDR) /* 243 */
 
 typedef struct {
-  uint8_t instance;    /* 0; extended-advertising instance id */
-  int8_t tx_power;     /* 0 dBm; controller range is -27..18 on S3 */
-  uint16_t adv_interval; /* 32 = 20 ms, in 0.625 ms units */
-  uint16_t adv_ms;     /* 120; how long each fragment is advertised */
+  uint8_t instance;          /* 0; extended-advertising instance id */
+  int8_t tx_power;           /* 0 dBm; controller range is -27..18 on S3 */
+  uint16_t adv_interval;     /* 32 = 20 ms, in 0.625 ms units */
+  uint16_t adv_ms;           /* 120; how long each fragment is advertised */
   uint16_t scan_interval_ms; /* 100 */
   uint16_t scan_window_ms;   /* 100 */
 } cc_road_ble_cfg_t;
@@ -66,12 +74,10 @@ typedef struct cc_road_ble {
   void* scan;    /* NimBLEScan* */
   void* adv_cb;  /* advertisement-stopped callback */
   void* scan_cb; /* scan-result callback */
-  void* rx_q;    /* QueueHandle_t of size_t (completed packet lengths) */
-  void* slot;    /* SemaphoreHandle_t guarding pktbuf */
   uint8_t tx_id;
   int ready;
   cc_road_frag_t frag;
-  uint8_t pktbuf[CC_ROAD_PKT_BUF_SZ];
+  cc_road_pkt_t pkt; /* completed packet waiting for recv() */
   cc_road_ble_stats_t stats;
 } cc_road_ble_t;
 

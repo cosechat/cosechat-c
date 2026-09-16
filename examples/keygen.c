@@ -10,12 +10,12 @@
 
 int main(void) {
   WC_RNG rng;
-  /* Large structs — static to avoid stack overflow on ESP32 */
+  /* Large structs and buffers — static to keep them off the stack */
   static cc_key_t key, imported;
-  uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ];
-  uint8_t kem_priv[CC_KEM_PRIVKEY_SZ];
-  uint8_t sign_pub[CC_SIGN_PUBKEY_SZ];
-  uint8_t kem_pub[CC_KEM_PUBKEY_SZ];
+  static uint8_t sign_priv[CC_SIGN_PRIVKEY_SZ];
+  static uint8_t kem_priv[CC_KEM_PRIVKEY_SZ];
+  static uint8_t sign_pub[CC_SIGN_PUBKEY_SZ];
+  static uint8_t kem_pub[CC_KEM_PUBKEY_SZ];
   uint8_t addr[CC_ADDR_SZ], addr2[CC_ADDR_SZ];
   int i, ret;
 

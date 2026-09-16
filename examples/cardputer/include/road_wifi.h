@@ -6,16 +6,22 @@
  *
  * Joins a WiFi network and exchanges fragmented cosechat packets over UDP,
  * broadcast by default so every node on the LAN sees announces without any
- * peer configuration. Datagrams are the shared road framing (road.h), so the
- * same fragmentation/reassembly code serves both roads.
+ * peer configuration. Datagrams are the shared road framing
+ * (cosechat_road.h), so the same fragmentation/reassembly code serves both
+ * roads.
  *
  * There is no background task: recv() drains the socket, so call it from your
  * main loop.
  *
+ * recv() attributes each packet: road->last_src / last_src_len are the
+ * datagram's sender as the socket reports it — 4 bytes of IPv4 address then 2
+ * bytes of UDP source port — never anything the sender wrote inside the
+ * packet.
+ *
  * The struct embeds ~16 KB of buffers — declare it static/global.
  */
 
-#include "road.h"
+#include "cosechat_road.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,7 +50,7 @@ typedef struct cc_road_wifi {
   uint8_t tx_id;
   int ready;
   cc_road_frag_t frag;
-  uint8_t pktbuf[CC_ROAD_PKT_BUF_SZ];
+  cc_road_pkt_t pkt; /* completed packet waiting for recv() */
   cc_road_wifi_stats_t stats;
 } cc_road_wifi_t;
 

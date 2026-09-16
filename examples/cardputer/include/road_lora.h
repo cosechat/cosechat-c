@@ -8,13 +8,18 @@
  * transmitting. Packets are fragmented to fit the SX1262 252-byte limit and
  * reassembled before being handed back as whole cosechat packets.
  *
+ * A radio frame carries payload and nothing else, so recv() is UNABLE to
+ * attribute a packet: road->last_src_len is always 0. A caller must treat that
+ * as "sender unknown" and must not fall back to the address the packet
+ * announces (see the contract on cc_road_t.last_src).
+ *
  * Defaults match the M5Stack LoRa Cap 1262 on a CardputerADV (SX1262 on the
  * shared SPI bus, antenna switch controlled by the caller via `antenna`).
  *
  * The struct embeds ~16 KB of buffers — declare it static/global.
  */
 
-#include "road.h"
+#include "cosechat_road.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,7 +70,6 @@ typedef struct cc_road_lora {
 
   void* radio; /* RadioLib SX1262* */
   void* tx_q;  /* QueueHandle_t of TxJob */
-  void* rx_q;  /* QueueHandle_t of size_t (completed packet lengths) */
   void* mux;   /* SemaphoreHandle_t (borrowed if cfg.spi_mux set) */
   void* task;
   int own_mux;
@@ -73,7 +77,7 @@ typedef struct cc_road_lora {
 
   uint8_t tx_id;
   cc_road_frag_t frag __attribute__((aligned(4)));
-  uint8_t pktbuf[CC_ROAD_PKT_BUF_SZ];
+  cc_road_pkt_t pkt; /* completed packet waiting for recv() */
   cc_road_lora_stats_t stats;
 } cc_road_lora_t;
 

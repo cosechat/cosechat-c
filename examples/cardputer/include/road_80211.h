@@ -12,27 +12,35 @@
  * both ends must sit on the same channel (cfg.channel).
  *
  * The frame body is [category=127, OUI(3), fragment...], so one frame carries
- * CC_ROAD_FRAG_MAX_PAYLOAD fragment bytes and packets are split with the
- * shared road framing (road.h).
+ * CC_ROAD_FRAG_PAYLOAD fragment bytes and packets are split with the shared
+ * road framing (cosechat_road.h).
  *
  * The promiscuous callback runs in the WiFi task and reassembles received
- * fragments there; recv() only drains a queue and never blocks.
+ * fragments there; recv() only reads the completed-packet slot and never
+ * blocks.
+ *
+ * recv() attributes each packet: road->last_src / last_src_len are the
+ * transmitter address (addr2) of the frame the packet arrived in — the
+ * medium's own addressing, never a claim from inside the packet. Frames here
+ * are unauthenticated, so a transmitter chooses the address it sends from; the
+ * field says which link address a packet came in on, not who owns that
+ * address.
  *
  * The struct embeds ~16 KB of buffers — declare it static/global.
  */
 
-#include "road.h"
+#include "cosechat_road.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define CC_ROAD_80211_HDR 24   /* management frame header */
-#define CC_ROAD_80211_ACTION 4 /* category byte + 3-byte OUI */
+#define CC_ROAD_80211_HDR 24       /* management frame header */
+#define CC_ROAD_80211_ACTION 4     /* category byte + 3-byte OUI */
 #define CC_ROAD_80211_CATEGORY 127 /* vendor-specific */
-#define CC_ROAD_80211_FRAME_MAX                            \
+#define CC_ROAD_80211_FRAME_MAX                                  \
   (CC_ROAD_80211_HDR + CC_ROAD_80211_ACTION + CC_ROAD_FRAG_HDR + \
-   CC_ROAD_FRAG_MAX_PAYLOAD) /* 280 */
+   CC_ROAD_FRAG_PAYLOAD) /* 280 */
 
 typedef struct {
   uint8_t channel; /* 1; both ends must use the same channel */
@@ -50,12 +58,10 @@ typedef struct cc_road_80211 {
   cc_road_80211_cfg_t cfg;
 
   uint8_t src[6]; /* random locally-administered source MAC */
-  void* rx_q;     /* QueueHandle_t of size_t (completed packet lengths) */
-  void* slot;     /* SemaphoreHandle_t guarding pktbuf */
   uint8_t tx_id;
   int ready;
   cc_road_frag_t frag;
-  uint8_t pktbuf[CC_ROAD_PKT_BUF_SZ];
+  cc_road_pkt_t pkt; /* completed packet waiting for recv() */
   cc_road_80211_stats_t stats;
 } cc_road_80211_t;
 

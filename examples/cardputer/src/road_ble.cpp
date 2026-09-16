@@ -5,17 +5,13 @@
  * TU, so the library still builds for LoRa/WiFi-only targets.
  */
 
-#include <Arduino.h>
-
-#if __has_include(<NimBLEDevice.h>)
-
-#include <NimBLEDevice.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
-#include <string.h>
+#if __has_include(<Arduino.h>) && __has_include(<NimBLEDevice.h>)
 
 #include "road_ble.h"
+
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <string.h>
 
 static cc_road_ble_t* impl_of(cc_road_t* road) {
   return (cc_road_ble_t*)road->ctx;
@@ -34,21 +30,6 @@ class CcScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice* dev) override;
 };
 
-/* Hand the completed packet to recv(). The slot semaphore is held until recv()
- * has copied pktbuf, so a new packet never overwrites one being read. */
-static void ble_push(cc_road_ble_t* r) {
-  if (xSemaphoreTake((SemaphoreHandle_t)r->slot, 0) != pdPASS) {
-    r->stats.rxDrop++;
-    return;
-  }
-  memcpy(r->pktbuf, r->frag.buf, r->frag.len);
-  size_t len = r->frag.len;
-  if (xQueueSend((QueueHandle_t)r->rx_q, &len, 0) != pdPASS) {
-    xSemaphoreGive((SemaphoreHandle_t)r->slot);
-    r->stats.rxDrop++;
-  }
-}
-
 void CcScanCallbacks::onResult(NimBLEAdvertisedDevice* dev) {
   if (!r)
     return;
@@ -61,14 +42,19 @@ void CcScanCallbacks::onResult(NimBLEAdvertisedDevice* dev) {
 
   const uint8_t* frag = (const uint8_t*)mfg.data() + 2;
   size_t flen = mfg.size() - 2;
-  int done = cc_road_frag_feed_n(&r->frag, frag, flen,
-                                 CC_ROAD_BLE_FRAG_PAYLOAD);
-  if (done < 0) {
+  /* The slot holds one packet for recv(): a completion it has not collected
+   * yet drops the new packet instead of being overwritten. No source: an
+   * anonymous advertisement carries no advertiser address, so this road cannot
+   * say who sent the packet (road->last_src_len stays 0). */
+  int done = cc_road_rx_frag(&r->frag, frag, flen, CC_ROAD_BLE_FRAG_PAYLOAD,
+                             NULL, 0, &r->pkt);
+  if (done == CC_ROAD_RX_BAD) {
     r->stats.rxDrop++;
-  } else if (done == 1) {
+  } else if (done != CC_ROAD_RX_MORE) {
     r->stats.rxFrag++;
     r->road.last_rssi = (float)dev->getRSSI();
-    ble_push(r);
+    if (done == CC_ROAD_RX_BUSY)
+      r->stats.rxDrop++;
   }
 }
 
@@ -83,83 +69,71 @@ void cc_road_ble_defaults(cc_road_ble_cfg_t* cfg) {
   cfg->scan_window_ms = 100;
 }
 
-static int ble_send(cc_road_t* road, const uint8_t* pkt, size_t len) {
-  cc_road_ble_t* r = impl_of(road);
+/* Emit one fragment as one anonymous extended advertisement, and wait out its
+ * advertising window before the next fragment replaces it. */
+static size_t ble_emit(void* ctx, const uint8_t* frag, size_t len) {
+  cc_road_ble_t* r = (cc_road_ble_t*)ctx;
   NimBLEExtAdvertising* adv = (NimBLEExtAdvertising*)r->adv;
   CcAdvCallbacks* done = (CcAdvCallbacks*)r->adv_cb;
-  uint8_t frag[CC_ROAD_FRAG_HDR + CC_ROAD_BLE_FRAG_PAYLOAD];
-  size_t total, i;
-  uint8_t id;
+  std::string mfg;
+
+  mfg.reserve(len + 2);
+  mfg.push_back((char)(CC_ROAD_BLE_COMPANY_ID & 0xff));
+  mfg.push_back((char)((CC_ROAD_BLE_COMPANY_ID >> 8) & 0xff));
+  mfg.append((const char*)frag, len);
+
+  NimBLEExtAdvertisement ad(BLE_HCI_LE_PHY_1M, BLE_HCI_LE_PHY_1M);
+  ad.setLegacyAdvertising(false);
+  ad.setConnectable(false);
+  ad.setScannable(false);
+  ad.setAnonymous(true);
+  ad.setMinInterval(r->cfg.adv_interval);
+  ad.setMaxInterval(r->cfg.adv_interval);
+  ad.setTxPower(r->cfg.tx_power);
+  ad.setManufacturerData(mfg);
+
+  if (adv->isActive(r->cfg.instance))
+    adv->stop(r->cfg.instance);
+  if (!adv->setInstanceData(r->cfg.instance, ad)) {
+    r->stats.txFail++;
+    return 0;
+  }
+  done->done = false;
+  if (!adv->start(r->cfg.instance, r->cfg.adv_ms, 0)) {
+    r->stats.txFail++;
+    return 0;
+  }
+
+  /* The controller repeats the advertisement until the window elapses. */
+  uint32_t start = millis();
+  while (!done->done &&
+         (uint32_t)(millis() - start) < (uint32_t)r->cfg.adv_ms + 250) {
+    delay(5);
+  }
+  r->stats.txFrag++;
+  return len;
+}
+
+static int ble_send(cc_road_t* road, const uint8_t* pkt, size_t len) {
+  cc_road_ble_t* r = impl_of(road);
 
   if (!r->ready)
     return CC_ROAD_ERR;
-  total = cc_road_frag_count_n(len, CC_ROAD_BLE_FRAG_PAYLOAD);
-  if (total == 0)
-    return CC_ROAD_ERR;
-
-  id = r->tx_id++;
-  for (i = 0; i < total; i++) {
-    size_t n = cc_road_frag_encode_n(pkt, len, id, (uint8_t)i, (uint8_t)total,
-                                     CC_ROAD_BLE_FRAG_PAYLOAD, frag);
-    if (n == 0)
-      return CC_ROAD_ERR;
-
-    std::string mfg;
-    mfg.reserve(n + 2);
-    mfg.push_back((char)(CC_ROAD_BLE_COMPANY_ID & 0xff));
-    mfg.push_back((char)((CC_ROAD_BLE_COMPANY_ID >> 8) & 0xff));
-    mfg.append((const char*)frag, n);
-
-    NimBLEExtAdvertisement ad(BLE_HCI_LE_PHY_1M, BLE_HCI_LE_PHY_1M);
-    ad.setLegacyAdvertising(false);
-    ad.setConnectable(false);
-    ad.setScannable(false);
-    ad.setAnonymous(true);
-    ad.setMinInterval(r->cfg.adv_interval);
-    ad.setMaxInterval(r->cfg.adv_interval);
-    ad.setTxPower(r->cfg.tx_power);
-    ad.setManufacturerData(mfg);
-
-    if (adv->isActive(r->cfg.instance))
-      adv->stop(r->cfg.instance);
-    if (!adv->setInstanceData(r->cfg.instance, ad)) {
-      r->stats.txFail++;
-      return CC_ROAD_ERR;
-    }
-    done->done = false;
-    if (!adv->start(r->cfg.instance, r->cfg.adv_ms, 0)) {
-      r->stats.txFail++;
-      return CC_ROAD_ERR;
-    }
-
-    /* The controller repeats the advertisement until the window elapses. */
-    uint32_t start = millis();
-    while (!done->done &&
-           (uint32_t)(millis() - start) < (uint32_t)r->cfg.adv_ms + 250) {
-      delay(5);
-    }
-    r->stats.txFrag++;
-  }
-  return CC_ROAD_OK;
+  return cc_road_send_pkt(pkt, len, r->tx_id++, CC_ROAD_BLE_FRAG_PAYLOAD,
+                          ble_emit, r);
 }
 
 static int ble_recv(cc_road_t* road, uint8_t* buf, size_t buf_sz,
                     size_t* len_out) {
   cc_road_ble_t* r = impl_of(road);
-  size_t len;
-  int ret = CC_ROAD_OK;
+  int ret;
 
   if (!buf || !len_out)
     return CC_ROAD_ERR;
-  if (xQueueReceive((QueueHandle_t)r->rx_q, &len, 0) != pdPASS)
+  if (r->pkt.len == 0)
     return CC_ROAD_EMPTY;
-  if (len <= buf_sz) {
-    memcpy(buf, r->pktbuf, len);
-    *len_out = len;
-  } else {
-    ret = CC_ROAD_ERR;
-  }
-  xSemaphoreGive((SemaphoreHandle_t)r->slot);
+  ret = cc_road_pkt_get(&r->pkt, buf, buf_sz, len_out);
+  r->pkt.len = 0; /* release the slot */
   return ret;
 }
 
@@ -172,11 +146,10 @@ int cc_road_ble_init(cc_road_ble_t* r, const cc_road_ble_cfg_t* cfg) {
     r->cfg = *cfg;
   cc_road_frag_init(&r->frag);
 
-  r->rx_q = xQueueCreate(4, sizeof(size_t));
-  r->slot = xSemaphoreCreateBinary();
-  if (!r->rx_q || !r->slot)
-    return CC_ROAD_ERR;
-  xSemaphoreGive((SemaphoreHandle_t)r->slot);
+  /* msg_id is the only sender identity on the wire and increments per send, so
+   * start it somewhere neither an attacker nor a peer that booted at the same
+   * moment can predict. */
+  r->tx_id = (uint8_t)(random(0, 256) ^ millis());
 
   NimBLEDevice::init("");
   r->adv = NimBLEDevice::getAdvertising();
@@ -230,14 +203,6 @@ void cc_road_ble_shutdown(cc_road_ble_t* r) {
   delete (CcAdvCallbacks*)r->adv_cb;
   r->scan_cb = NULL;
   r->adv_cb = NULL;
-  if (r->rx_q) {
-    vQueueDelete((QueueHandle_t)r->rx_q);
-    r->rx_q = NULL;
-  }
-  if (r->slot) {
-    vSemaphoreDelete((SemaphoreHandle_t)r->slot);
-    r->slot = NULL;
-  }
 }
 
-#endif /* __has_include(<NimBLEDevice.h>) */
+#endif /* __has_include(<Arduino.h>) && __has_include(<NimBLEDevice.h>) */

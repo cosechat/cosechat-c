@@ -10,15 +10,17 @@
  * (settings.h:283) regardless. Drop it: this is an Arduino build. */
 #undef WOLFSSL_ESPIDF
 
-/* ML-DSA-44 (Dilithium) and ML-KEM-512 are experimental in wolfSSL and
- * require this opt-in. */
+/* The post-quantum families the build needs are experimental in wolfSSL and
+ * require this opt-in. These macros enable a whole family, not one parameter
+ * set: the actual levels (currently ML-DSA-65 + ML-KEM-768) are chosen by
+ * CC_SIGN_LEVEL / CC_KEM_LEVEL in include/cosechat.h, not here. */
 #define WOLFSSL_EXPERIMENTAL_SETTINGS
 
-/* ML-DSA-44 (Dilithium) */
+/* ML-DSA (Dilithium) — level set by CC_SIGN_LEVEL */
 #define HAVE_DILITHIUM
 #define WOLFSSL_WC_DILITHIUM
 
-/* ML-KEM-512 */
+/* ML-KEM — level set by CC_KEM_LEVEL */
 #define WOLFSSL_HAVE_MLKEM
 #define WOLFSSL_WC_MLKEM
 

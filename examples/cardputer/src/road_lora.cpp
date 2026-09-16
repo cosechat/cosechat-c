@@ -3,18 +3,20 @@
  *
  * A dedicated FreeRTOS task owns the radio: it drains the TX queue (each job
  * is one fragment) and otherwise keeps the SX1262 in RX. Received fragments
- * are reassembled into whole cosechat packets and queued for recv().
+ * are reassembled into whole cosechat packets and left in the road's slot for
+ * recv().
  *
  * The SX1262 packet limit is 252 bytes, so every cosechat packet is split by
- * the shared road framing (see road.h).
+ * the shared road framing (see cosechat_road.h).
  *
  * Compiled only when RadioLib is available; otherwise this is an empty TU.
  */
 
+#if __has_include(<Arduino.h>) && __has_include(<RadioLib.h>)
+
+#include "road_lora.h"
+
 #include <Arduino.h>
-
-#if __has_include(<RadioLib.h>)
-
 #include <RadioLib.h>
 #include <SPI.h>
 #include <freertos/FreeRTOS.h>
@@ -23,10 +25,7 @@
 #include <freertos/task.h>
 #include <string.h>
 
-#include "road_lora.h"
-
-#define CC_LORA_MAX_PKT (CC_ROAD_FRAG_MAX_PAYLOAD + CC_ROAD_FRAG_HDR) /* 252 \
-                                                                       */
+#define CC_LORA_MAX_PKT (CC_ROAD_FRAG_PAYLOAD + CC_ROAD_FRAG_HDR) /* 252 */
 
 typedef struct {
   uint8_t data[CC_LORA_MAX_PKT];
@@ -87,7 +86,6 @@ static void radio_task(void* arg) {
   cc_road_lora_t* r = (cc_road_lora_t*)arg;
   SX1262* radio = (SX1262*)r->radio;
   QueueHandle_t txq = (QueueHandle_t)r->tx_q;
-  QueueHandle_t rxq = (QueueHandle_t)r->rx_q;
 
   bus_lock(r);
   set_antenna(r, 1);
@@ -148,25 +146,23 @@ static void radio_task(void* arg) {
       if (evt.len == 0) {
         r->stats.rxDrop++;
       } else {
-        int done = cc_road_frag_feed(&r->frag, evt.data, evt.len);
-        if (done < 0) {
+        int done;
+        bus_lock(r);
+        /* No source: an SX1262 frame carries no sender field, so this road
+         * cannot say who sent the packet (road->last_src_len stays 0). */
+        done = cc_road_rx_frag(&r->frag, evt.data, evt.len,
+                               CC_ROAD_FRAG_PAYLOAD, NULL, 0, &r->pkt);
+        bus_unlock(r);
+        if (done == CC_ROAD_RX_BAD) {
           r->stats.rxDrop++;
-        } else if (done == 1) {
+        } else if (done != CC_ROAD_RX_MORE) {
+          /* complete: handed to the slot, or dropped because recv() had not
+           * collected the previous packet yet. */
           r->stats.rxFrag++;
           r->road.last_rssi = evt.rssi;
           r->road.last_snr = evt.snr;
-          /* Keep one completed packet at a time: pktbuf is a single slot. */
-          bus_lock(r);
-          bool busy = uxQueueMessagesWaiting(rxq) > 0;
-          if (!busy) {
-            memcpy(r->pktbuf, r->frag.buf, r->frag.len);
-            size_t len = r->frag.len;
-            bus_unlock(r);
-            xQueueSend(rxq, &len, 0);
-          } else {
-            bus_unlock(r);
+          if (done == CC_ROAD_RX_BUSY)
             r->stats.rxDrop++;
-          }
         }
       }
     } else if (irq & RADIOLIB_SX126X_IRQ_TIMEOUT) {
@@ -180,52 +176,44 @@ static void radio_task(void* arg) {
   }
 }
 
+/* Emit one fragment: hand it to the radio task, which counts what the radio
+ * actually transmitted. */
+static size_t lora_emit(void* ctx, const uint8_t* frag, size_t len) {
+  cc_road_lora_t* r = (cc_road_lora_t*)ctx;
+  TxJob job;
+
+  if (len == 0 || len > sizeof(job.data))
+    return 0;
+  memcpy(job.data, frag, len);
+  job.len = (uint8_t)len;
+  if (xQueueSend((QueueHandle_t)r->tx_q, &job, pdMS_TO_TICKS(5000)) != pdPASS)
+    return 0;
+  return len;
+}
+
 static int lora_send(cc_road_t* road, const uint8_t* pkt, size_t len) {
   cc_road_lora_t* r = impl_of(road);
-  QueueHandle_t txq = (QueueHandle_t)r->tx_q;
-  size_t total, i;
-  uint8_t id;
-  int sent = 0;
 
   if (!r->ready)
     return CC_ROAD_ERR;
-  total = cc_road_frag_count(len);
-  if (total == 0)
-    return CC_ROAD_ERR;
-
-  id = r->tx_id++;
-  for (i = 0; i < total; i++) {
-    TxJob job;
-    size_t n =
-        cc_road_frag_encode(pkt, len, id, (uint8_t)i, (uint8_t)total, job.data);
-    if (n == 0)
-      return CC_ROAD_ERR;
-    job.len = (uint8_t)n;
-    if (xQueueSend(txq, &job, pdMS_TO_TICKS(5000)) != pdPASS)
-      return CC_ROAD_ERR;
-    sent++;
-  }
-  return CC_ROAD_OK;
+  return cc_road_send_pkt(pkt, len, r->tx_id++, CC_ROAD_FRAG_PAYLOAD, lora_emit,
+                          r);
 }
 
 static int lora_recv(cc_road_t* road, uint8_t* buf, size_t buf_sz,
                      size_t* len_out) {
   cc_road_lora_t* r = impl_of(road);
-  size_t len;
-  int ret = CC_ROAD_OK;
+  int ret;
 
   if (!buf || !len_out)
     return CC_ROAD_ERR;
-  if (xQueueReceive((QueueHandle_t)r->rx_q, &len, 0) != pdPASS) {
+  if (r->pkt.len == 0)
     return CC_ROAD_EMPTY;
-  }
   bus_lock(r);
-  if (len <= buf_sz) {
-    memcpy(buf, r->pktbuf, len);
-    *len_out = len;
-  } else {
-    ret = CC_ROAD_ERR;
-  }
+  ret = cc_road_pkt_get(&r->pkt, buf, buf_sz, len_out);
+  if (ret == CC_ROAD_OK)
+    cc_road_src_take(&r->pkt, &r->road); /* always "unknown" on this road */
+  r->pkt.len = 0;                        /* release the slot */
   bus_unlock(r);
   return ret;
 }
@@ -238,6 +226,11 @@ int cc_road_lora_init(cc_road_lora_t* r, const cc_road_lora_cfg_t* cfg) {
   if (cfg)
     r->cfg = *cfg;
   cc_road_frag_init(&r->frag);
+
+  /* msg_id is the only sender identity on the wire and increments per send, so
+   * start it somewhere neither an attacker nor a peer that booted at the same
+   * moment can predict. */
+  r->tx_id = (uint8_t)(random(0, 256) ^ millis());
 
   if (r->cfg.task_stack == 0)
     r->cfg.task_stack = 4096;
@@ -277,8 +270,7 @@ int cc_road_lora_init(cc_road_lora_t* r, const cc_road_lora_cfg_t* cfg) {
   radio->setDio2AsRfSwitch(r->cfg.dio2_rf_switch != 0);
 
   r->tx_q = xQueueCreate(64, sizeof(TxJob));
-  r->rx_q = xQueueCreate(4, sizeof(size_t));
-  if (!r->tx_q || !r->rx_q)
+  if (!r->tx_q)
     return CC_ROAD_ERR;
 
   r->road.name = "lora";
@@ -316,10 +308,6 @@ void cc_road_lora_shutdown(cc_road_lora_t* r) {
     vQueueDelete((QueueHandle_t)r->tx_q);
     r->tx_q = NULL;
   }
-  if (r->rx_q) {
-    vQueueDelete((QueueHandle_t)r->rx_q);
-    r->rx_q = NULL;
-  }
 }
 
-#endif /* __has_include(<RadioLib.h>) */
+#endif /* __has_include(<Arduino.h>) && __has_include(<RadioLib.h>) */

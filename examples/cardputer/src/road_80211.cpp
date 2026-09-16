@@ -1,23 +1,22 @@
 /*
  * road_80211 — unauthenticated 802.11 management-frame road.
  *
- * Compiled only where the ESP32 WiFi stack is available; otherwise this is an
- * empty TU.
+ * Pure ESP-IDF: this road needs neither Arduino nor any C++ runtime, so it
+ * builds under the arduino and espidf frameworks alike, and is an empty TU
+ * wherever the WiFi stack is absent.
  */
-
-#include <Arduino.h>
 
 #if __has_include(<esp_wifi.h>)
 
+#include "road_80211.h"
+
 #include <esp_event.h>
 #include <esp_netif.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <string.h>
-
-#include "road_80211.h"
 
 /* No real vendor owns this OUI; it only has to be ours on both ends. */
 static const uint8_t k_oui[3] = {0xCC, 0x0C, 0x05};
@@ -28,21 +27,6 @@ static cc_road_80211_t* g_road;
 
 static cc_road_80211_t* impl_of(cc_road_t* road) {
   return (cc_road_80211_t*)road->ctx;
-}
-
-/* Hand the completed packet to recv(). The slot semaphore is held until recv()
- * has copied pktbuf, so a new packet never overwrites one being read. */
-static void pkt_push(cc_road_80211_t* r) {
-  if (xSemaphoreTake((SemaphoreHandle_t)r->slot, 0) != pdPASS) {
-    r->stats.rxDrop++;
-    return;
-  }
-  memcpy(r->pktbuf, r->frag.buf, r->frag.len);
-  size_t len = r->frag.len;
-  if (xQueueSend((QueueHandle_t)r->rx_q, &len, 0) != pdPASS) {
-    xSemaphoreGive((SemaphoreHandle_t)r->slot);
-    r->stats.rxDrop++;
-  }
 }
 
 static void cc_80211_rx(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -79,13 +63,18 @@ static void cc_80211_rx(void* buf, wifi_promiscuous_pkt_type_t type) {
 
   frag = f + CC_ROAD_80211_HDR + CC_ROAD_80211_ACTION;
   flen = (size_t)(len - CC_ROAD_80211_HDR - CC_ROAD_80211_ACTION);
-  done = cc_road_frag_feed(&r->frag, frag, flen);
-  if (done < 0) {
+  /* The slot holds one packet for recv(): a completion it has not collected
+   * yet drops the new packet instead of being overwritten. The frame's
+   * transmitter address (addr2) is what this packet is attributed to. */
+  done = cc_road_rx_frag(&r->frag, frag, flen, CC_ROAD_FRAG_PAYLOAD, f + 10,
+                         CC_ROAD_SRC_SZ, &r->pkt);
+  if (done == CC_ROAD_RX_BAD) {
     r->stats.rxDrop++;
-  } else if (done == 1) {
+  } else if (done != CC_ROAD_RX_MORE) {
     r->stats.rxFrag++;
     r->road.last_rssi = (float)pkt->rx_ctrl.rssi;
-    pkt_push(r);
+    if (done == CC_ROAD_RX_BUSY)
+      r->stats.rxDrop++;
   }
 }
 
@@ -95,61 +84,67 @@ void cc_road_80211_defaults(cc_road_80211_cfg_t* cfg) {
   cfg->channel = 1;
 }
 
+/* The action-frame header is built once per packet; each fragment is appended
+ * to it. */
+typedef struct {
+  cc_road_80211_t* r;
+  uint8_t* frame;
+  size_t off;
+} TxFrame;
+
+static size_t cc_80211_emit(void* ctx, const uint8_t* frag, size_t len) {
+  TxFrame* tx = (TxFrame*)ctx;
+  cc_road_80211_t* r = tx->r;
+
+  if (len == 0 || tx->off + len > CC_ROAD_80211_FRAME_MAX)
+    return 0;
+  memcpy(tx->frame + tx->off, frag, len);
+  if (esp_wifi_80211_tx(WIFI_IF_STA, tx->frame, (int)(tx->off + len), true) !=
+      ESP_OK) {
+    r->stats.txFail++;
+    return 0;
+  }
+  r->stats.txFrag++;
+  vTaskDelay(pdMS_TO_TICKS(2));
+  return len;
+}
+
 static int cc_80211_send(cc_road_t* road, const uint8_t* pkt, size_t len) {
   cc_road_80211_t* r = impl_of(road);
   uint8_t frame[CC_ROAD_80211_FRAME_MAX];
-  size_t total, i, off;
-  uint8_t id;
+  TxFrame tx;
 
   if (!r->ready)
     return CC_ROAD_ERR;
-  total = cc_road_frag_count(len);
-  if (total == 0)
-    return CC_ROAD_ERR;
 
-  off = CC_ROAD_80211_HDR + CC_ROAD_80211_ACTION;
-  memset(frame, 0, off);
-  frame[0] = 0xd0; /* management, action */
+  tx.r = r;
+  tx.frame = frame;
+  tx.off = CC_ROAD_80211_HDR + CC_ROAD_80211_ACTION;
+  memset(frame, 0, tx.off);
+  frame[0] = 0xd0;                /* management, action */
   memcpy(frame + 4, k_bcast, 6);  /* addr1: destination */
   memcpy(frame + 10, r->src, 6);  /* addr2: source */
   memcpy(frame + 16, k_bcast, 6); /* addr3: BSSID (none) */
   frame[CC_ROAD_80211_HDR] = CC_ROAD_80211_CATEGORY;
   memcpy(frame + CC_ROAD_80211_HDR + 1, k_oui, 3);
 
-  id = r->tx_id++;
-  for (i = 0; i < total; i++) {
-    size_t n =
-        cc_road_frag_encode(pkt, len, id, (uint8_t)i, (uint8_t)total,
-                            frame + off);
-    if (n == 0)
-      return CC_ROAD_ERR;
-    if (esp_wifi_80211_tx(WIFI_IF_STA, frame, (int)(off + n), true) != ESP_OK) {
-      r->stats.txFail++;
-      return CC_ROAD_ERR;
-    }
-    r->stats.txFrag++;
-    delay(2);
-  }
-  return CC_ROAD_OK;
+  return cc_road_send_pkt(pkt, len, r->tx_id++, CC_ROAD_FRAG_PAYLOAD,
+                          cc_80211_emit, &tx);
 }
 
 static int cc_80211_recv(cc_road_t* road, uint8_t* buf, size_t buf_sz,
                          size_t* len_out) {
   cc_road_80211_t* r = impl_of(road);
-  size_t len;
-  int ret = CC_ROAD_OK;
+  int ret;
 
   if (!buf || !len_out)
     return CC_ROAD_ERR;
-  if (xQueueReceive((QueueHandle_t)r->rx_q, &len, 0) != pdPASS)
+  if (r->pkt.len == 0)
     return CC_ROAD_EMPTY;
-  if (len <= buf_sz) {
-    memcpy(buf, r->pktbuf, len);
-    *len_out = len;
-  } else {
-    ret = CC_ROAD_ERR;
-  }
-  xSemaphoreGive((SemaphoreHandle_t)r->slot);
+  ret = cc_road_pkt_get(&r->pkt, buf, buf_sz, len_out);
+  if (ret == CC_ROAD_OK)
+    cc_road_src_take(&r->pkt, &r->road); /* who this packet came from */
+  r->pkt.len = 0;                        /* release the slot */
   return ret;
 }
 
@@ -165,16 +160,15 @@ int cc_road_80211_init(cc_road_80211_t* r, const cc_road_80211_cfg_t* cfg) {
     r->cfg = *cfg;
   cc_road_frag_init(&r->frag);
 
-  r->rx_q = xQueueCreate(4, sizeof(size_t));
-  r->slot = xSemaphoreCreateBinary();
-  if (!r->rx_q || !r->slot)
-    return CC_ROAD_ERR;
-  xSemaphoreGive((SemaphoreHandle_t)r->slot);
+  /* msg_id is the only sender identity on the wire and increments per send, so
+   * start it somewhere neither an attacker nor a peer that booted at the same
+   * moment can predict. */
+  r->tx_id = (uint8_t)esp_random();
 
-  /* Random locally-administered unicast address: nothing identifies the node. */
+  /* Random locally-administered unicast address: nothing identifies the node.
+   */
   r->src[0] = (uint8_t)((esp_random() & 0xfc) | 0x02);
-  for (int i = 1; i < 6; i++)
-    r->src[i] = (uint8_t)esp_random();
+  for (int i = 1; i < 6; i++) r->src[i] = (uint8_t)esp_random();
 
   /* Arduino may already have brought these up; failure here is fine. */
   esp_netif_init();
@@ -216,14 +210,6 @@ void cc_road_80211_shutdown(cc_road_80211_t* r) {
   esp_wifi_stop();
   esp_wifi_deinit();
   g_road = NULL;
-  if (r->rx_q) {
-    vQueueDelete((QueueHandle_t)r->rx_q);
-    r->rx_q = NULL;
-  }
-  if (r->slot) {
-    vSemaphoreDelete((SemaphoreHandle_t)r->slot);
-    r->slot = NULL;
-  }
 }
 
 #endif /* __has_include(<esp_wifi.h>) */
