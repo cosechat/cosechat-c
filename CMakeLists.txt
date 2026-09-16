@@ -120,3 +120,25 @@ target_compile_definitions(test_relay PRIVATE CC_RELAY_PATHS=4
                                              CC_RELAY_AIRTIME_ANNOUNCE=40960
                                              CC_RELAY_AIRTIME_DATA=32768)
 add_test(NAME cosechat_relay COMMAND test_relay)
+
+# The Cardputer example's passphrase-encrypted store. It is application policy
+# rather than library API (the library stays storage-agnostic), but it is built
+# and tested here for the same reason the road and relay framing are: the
+# module takes byte buffers and knows nothing about SD.h, so the crypto can be
+# exercised on the host. PlatformIO compiles the same file into the sketch —
+# examples/cardputer/src/ is its source root, so the module lands there and in
+# the test build from one copy. The test is named with the cosechat prefix
+# because `make test` runs `ctest -R cosechat`.
+add_library(cardputer_store STATIC examples/cardputer/src/cc_store.c)
+target_include_directories(cardputer_store PUBLIC examples/cardputer/src)
+target_link_libraries(cardputer_store PUBLIC wolfssl)
+
+add_executable(test_store test/test_store.c)
+# The test takes the identity file's size from the library's own parameter
+# macros (include/cosechat.h) -- the same ones main.cpp builds that file from --
+# so a change of ML-DSA/ML-KEM level moves the test with it instead of leaving
+# a stale number behind. That header pulls in wolfCOSE's; the store module
+# itself links only wolfSSL.
+target_include_directories(test_store PRIVATE include ${wolfcose_src_SOURCE_DIR}/include)
+target_link_libraries(test_store PRIVATE cardputer_store)
+add_test(NAME cosechat_store COMMAND test_store)

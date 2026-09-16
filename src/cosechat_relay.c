@@ -13,6 +13,12 @@
 #ifndef WOLFSSL_USER_SETTINGS
 #include <wolfssl/options.h>
 #endif
+/* hash.h declares the one-shot wc_Sha256Hash() that dup_digest()'s fallback
+   uses; sha256.h only carries the streaming wc_Sha256* API. Under
+   WOLFSSL_USER_SETTINGS the declaration has to come from here, or the call is
+   an implicit declaration (a hard error on newer clang, a wrong-typed call on
+   GCC). */
+#include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 
 _Static_assert(CC_RELAY_PATHS >= 1, "at least one path entry");

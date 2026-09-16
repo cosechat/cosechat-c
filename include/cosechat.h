@@ -61,6 +61,20 @@ extern "C" {
  * CC_KEM_TYPE is derived, because wolfSSL's ML-KEM types are enum values and
  * cannot be tested in a preprocessor conditional.
  *
+ * The wolfSSL FEATURE set these sources need (ML-DSA, ML-KEM, AES-GCM, HKDF,
+ * SHA-256, SHA-3, key generation) is declared for PlatformIO in library.json's
+ * build.flags as "-DNAME=", with an empty replacement list, and that form is
+ * deliberate: a bare -DNAME means NAME 1, which then collides with the bare
+ * #define NAME that every wolfSSL settings file uses (the generated
+ * wolfssl/options.h, and any user_settings.h), and the compiler reports the
+ * redefinition on every translation unit of this library. These names are
+ * never read numerically — wolfSSL tests them with #ifdef / #if defined only —
+ * so the empty form is equivalent and agrees with both routes. A consumer
+ * whose own user_settings.h decides this set is expected to be authoritative:
+ * these flags only change how this library's own sources read wolfSSL's
+ * headers, never how wolfSSL itself is compiled, so a disagreement between the
+ * two is a build defect even when it compiles.
+ *
  * COSE identifiers, documented rather than left floating in code:
  *   ML-DSA-65 is -49 (draft-ietf-cose-dilithium-11, in AUTH48 as RFC 9964);
  *   AES-256-GCM is 3 (RFC 9053); HKDF-SHA-256 is 5 (RFC 9053).

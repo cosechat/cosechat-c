@@ -7,17 +7,31 @@
 //
 //   Tab   = cycle peers        Enter = send chat to selected peer
 //   Serial console: r rotate identity, x revoke it, n mint a new identity,
-//   w wipe the card ('n' and 'w' ask for a confirmation key).
+//   w wipe the card ('n' and 'w' ask for a confirmation key), p set or change
+//   the store passphrase.
 //
-// SD, under /cc/, every file wrapped in a 9-byte magic+version+CRC envelope:
-//   key.bin         <form byte><keys> -- the SEED form by default
+// SD, under /cc/, every file wrapped in a 9-byte magic+version+CRC envelope.
+// The identity, the counter, the revocation list and each peer's replay window
+// are additionally STORED SEALED: an AES-256-GCM container (magic "CCSP") whose
+// key is derived from a passphrase typed on the device at boot, with NO
+// recovery -- lose the passphrase and the identity is only recoverable by
+// wiping the card and minting a new one.
+//   key.bin         SEALED. <form byte><keys> -- the SEED form by default
 //                   (sign_seed, kem_seed, sign_pub); the expanded form is
 //                   written only for an identity that has no seed, i.e. one
 //                   loaded from an expanded file.
-//   counter.bin     freshness counter, announce seq, identity-retired flag
-//   revoked.bin     remembered retirements
-//   peers/<addr_hex>.bin  the cached announce (with a payload version byte)
-//   peers/<addr_hex>.rp   that peer's two replay windows
+//   counter.bin     SEALED. freshness counter, announce seq, retired flag
+//   revoked.bin     SEALED. remembered retirements
+//   peers/<addr_hex>.bin  PLAINTEXT. the cached announce (with a payload
+//                   version byte). It is broadcast in the clear anyway, and
+//                   keeping it readable is what lets the peer list be shown
+//                   while the store is locked.
+//   peers/<addr_hex>.rp   SEALED. that peer's two replay windows
+// A card written before the store existed is still read as plaintext, and
+// console 'p' seals it (that is the migration). The sealed files are opened by
+// storeRead()/storeWrite() below and by nothing else; the plaintext of a
+// container is the file exactly as it would be on a plaintext card, envelope
+// and CRC included.
 // Every peer's public keys are also cached in RAM; SD is the cold store.
 //
 // The SD card and the SX1262 share one SPI bus, so the demo creates a mutex
@@ -52,6 +66,10 @@ extern "C" {
 #include "road_lora.h"
 #endif
 #include <wolfssl/wolfcrypt/random.h>
+/* The passphrase-encrypted store (see the layout note at the top of this file
+ * and cc_store.h). Application policy, medium-free: it takes and returns byte
+ * buffers, and every byte of the file I/O below is still this file's job. */
+#include "cc_store.h"
 }
 
 // ---------------------------------------------------------------------------
@@ -116,12 +134,12 @@ extern "C" {
 #define REPLAY_VERSION 1
 #define PEER_VERSION 1 /* payload version of PEER_DIR/<hex>.bin */
 
-// Link (session) layer. LINK_MAX bounds concurrent sessions: this is a
+// Link (session) layer. LINK_SESSION_MAX bounds concurrent sessions: this is a
 // handheld with one selected peer at a time, so four covers the live
 // conversation plus a handshake or two in flight, at 168 bytes each (672 B
 // total) instead of the ~2.2 KiB sixteen would take. A fifth peer simply
 // waits for a slot to free.
-#define LINK_MAX 4
+#define LINK_SESSION_MAX 4
 // A responder-side handshake does NOT get a session slot. It is held in this
 // tiny pending table with a short TTL and is only promoted into the session
 // table once it has carried an authenticated record. Otherwise four
@@ -368,7 +386,7 @@ static uint8_t relayBuf[CC_ANN_BUF_SZ + 1];
 // nothing is persisted, so a reboot forgets links and the peers simply
 // re-handshake.
 // ---------------------------------------------------------------------------
-static cc_link_t links[LINK_MAX];
+static cc_link_t links[LINK_SESSION_MAX];
 // Responder-side handshakes waiting for their first authenticated record. A
 // session slot is only ever maintained while its peer is known (see
 // linkMaintain), which is what stops an unauthenticated request from being kept
@@ -936,14 +954,309 @@ static void envWriteHeader(uint8_t h[ENV_HDR_SZ], uint32_t crc) {
 // Read the header and hand back the CRC it claims. False means "not one of our
 // files" (wrong magic or version, or too short). The payload is checked by the
 // caller, which is where the payload bytes are.
+//
+// Two forms of the same nine bytes: the store hands a whole file over as a
+// buffer, while the peer cache (plaintext by design) still streams from a File.
+static bool envReadHeader(const uint8_t* p, size_t n, uint32_t* crc_out) {
+  if (n < ENV_HDR_SZ)
+    return false;
+  if (memcmp(p, ENV_MAGIC, 4) != 0 || p[4] != ENV_VERSION)
+    return false;
+  *crc_out = (uint32_t)p[5] | ((uint32_t)p[6] << 8) | ((uint32_t)p[7] << 16) |
+             ((uint32_t)p[8] << 24);
+  return true;
+}
+
 static bool envReadHeader(File& f, uint32_t* crc_out) {
   uint8_t h[ENV_HDR_SZ];
   if (f.read(h, ENV_HDR_SZ) != ENV_HDR_SZ)
     return false;
-  if (memcmp(h, ENV_MAGIC, 4) != 0 || h[4] != ENV_VERSION)
+  return envReadHeader(h, ENV_HDR_SZ, crc_out);
+}
+
+// ---------------------------------------------------------------------------
+// The passphrase store: the ONE place the two storage modes are decided.
+//
+// Four of the five file kinds are sealed (see the layout note at the top of
+// this file); the whole difference between a plaintext card and a sealed one
+// lives in storeRead()/storeWrite() below, and every reader and writer in this
+// file goes through them instead of touching sdAccess or the envelope directly.
+// That is what keeps the payload parsers, the inner version bytes and every
+// size check above them unchanged: the plaintext of a container IS the file a
+// plaintext card would have.
+//
+// The context a container is bound to is the path string itself -- both sides
+// of every call pass the same expression (KEY_FILE, or the buffer peerPath()
+// filled), so a container cannot be sealed for one name and opened under
+// another by a mistyped literal.
+//
+// Atomicity: a sealed write never overwrites the live file in place. It seals
+// into scratch, writes a temp file, RE-OPENS AND UNSEALS IT to prove it reads
+// back, and only then replaces the real file. Any failure leaves the previous
+// file where it was; a half-written temp file is detectable by magic and length
+// alone, and a leftover ".tmp" is not a name any loader opens.
+// ---------------------------------------------------------------------------
+enum { STORE_PLAIN = 0, STORE_SEALED = 1 };
+static int storeMode = STORE_PLAIN;
+
+// The identity file is neither a container nor one of our plaintext files: it
+// is damaged, or something else's. Tracked so the messages can say that instead
+// of calling a file nothing can read "PLAINTEXT" -- a false statement about the
+// operator's security posture -- while the decision (inert, never mint, no
+// prompt) stays exactly what a damaged key file always did.
+static bool storeDamaged = false;
+
+// The unlocked key. RAM only, and zeroized (cc_store_lock) by the wipe path.
+static cc_store_key_t storeKey;
+
+// Scratch, sized from the file kinds themselves: the largest plaintext is the
+// expanded-form identity file (ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ = 8394), and the
+// largest container is that plus the store's overhead (8453). Two buffers, and
+// they are the whole of the store's static cost:
+//   storeCont  a container: what is read, what is sealed, what is written, and
+//              the scratch the identity file's exports and its derived public
+//              key are sunk into (7616 bytes of that are used at most)
+//   storePlain a plaintext image: the destination of a read (the loaders parse
+//              it in place) and the image keySave assembles and hands to
+//              storeWrite
+// No third buffer: a sealed write verifies itself by reading the temp file back
+// and comparing it against storeCont, which is still holding the container it
+// just sealed, so nothing needs a second plaintext-sized region.
+#define STORE_PT_SZ (ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ)
+static uint8_t storeCont[CC_STORE_SEALED_SZ(STORE_PT_SZ)]; /* a container */
+static uint8_t storePlain[STORE_PT_SZ]; /* read destination; save image */
+
+// A sealed store with no key (a wrong passphrase exhausted the attempts, or the
+// card was wiped): the sealed kinds cannot be read at all, and calling a file
+// "invalid" when it is merely locked would be a lie. The loaders ask this
+// first and fall back to their own fail-safe; the boot path has already said
+// why in the operator's words.
+static bool storeLocked() {
+  return storeMode == STORE_SEALED && !storeKey.unlocked;
+}
+
+// Read a whole file. The same three answers the loaders speak: ABSENT (no such
+// file, or no card), OK, or INVALID (there but unusable -- unreadable, empty,
+// or larger than the caller's buffer, which is a file this node could not open
+// anyway; a truncated read would be the wrong verdict). Existence is asked
+// separately from the open, because "it is not there" and "I cannot read it"
+// lead to different decisions above (first boot vs damage).
+static int fileReadAll(const char* path, uint8_t* buf, size_t cap,
+                       size_t* len) {
+  size_t n = 0;
+  *len = 0;
+  if (!sdInit())
+    return FILE_ST_NOCARD;
+  if (!sdExists(path))
+    return FILE_ST_ABSENT;
+  xSemaphoreTake(spiMux, portMAX_DELAY);
+  File f = SD.open(path, FILE_READ);
+  if (f && !f.isDirectory()) {
+    size_t want = (size_t)f.size();
+    if (want > 0 && want <= cap && f.read(buf, want) == want)
+      n = want;
+  }
+  if (f)
+    f.close();
+  xSemaphoreGive(spiMux);
+  *len = n;
+  return n > 0 ? FILE_ST_OK : FILE_ST_INVALID;
+}
+
+// Write a whole file. False means the card refused it; the caller decides what
+// that means (for a sealed write it means the old file stays).
+static bool fileWriteAll(const char* path, const uint8_t* buf, size_t n) {
+  if (!sdInit())
     return false;
-  *crc_out = (uint32_t)h[5] | ((uint32_t)h[6] << 8) | ((uint32_t)h[7] << 16) |
-             ((uint32_t)h[8] << 24);
+  xSemaphoreTake(spiMux, portMAX_DELAY);
+  File f = SD.open(path, FILE_WRITE);
+  bool ok = f && f.write(buf, n) == n;
+  if (f)
+    f.close();
+  xSemaphoreGive(spiMux);
+  return ok;
+}
+
+static bool fileRemove(const char* path) {
+  if (!sdInit())
+    return false;
+  xSemaphoreTake(spiMux, portMAX_DELAY);
+  bool ok = SD.remove(path);
+  xSemaphoreGive(spiMux);
+  return ok;
+}
+
+static bool fileRename(const char* from, const char* to) {
+  if (!sdInit())
+    return false;
+  xSemaphoreTake(spiMux, portMAX_DELAY);
+  /* FS::rename is in the bundled framework (libraries/FS/src/FS.h) over the
+   * VFS rename, which is the FAT driver's f_rename: a metadata move on the
+   * same volume, and it does not follow symlinks or copy bytes. */
+  bool ok = SD.rename(from, to);
+  xSemaphoreGive(spiMux);
+  return ok;
+}
+
+// OK / ABSENT / INVALID, the same three answers the loaders already speak: in
+// plaintext mode this is the file verbatim, in sealed mode it is the container
+// opened with the key in use. A container that does not open (damage, or a file
+// from another key) is INVALID -- never ABSENT, because absence is what means
+// "first boot" and decides whether this node mints.
+static int storeRead(const char* path, const char* ctx, uint8_t* out,
+                     size_t cap, size_t* len) {
+  size_t n = 0;
+  int rc = fileReadAll(path, storeCont, sizeof(storeCont), &n);
+  if (rc != FILE_ST_OK)
+    return rc;
+  if (storeMode == STORE_PLAIN) {
+    if (n > cap)
+      return FILE_ST_INVALID;
+    memcpy(out, storeCont, n);
+    *len = n;
+    return FILE_ST_OK;
+  }
+  cc_store_info_t info;
+  if (storeLocked())
+    return FILE_ST_INVALID;
+  if (cc_store_probe(storeCont, n, &info) != CC_STORE_OK || info.plain_len > cap)
+    return FILE_ST_INVALID;
+  if (cc_store_unseal(&storeKey, ctx, storeCont, n, out, cap, len) !=
+      CC_STORE_OK)
+    return FILE_ST_INVALID;
+  return FILE_ST_OK;
+}
+
+// Make a target name sane before writing beside it. A leftover "<path>.old" is
+// either the previous copy of an interrupted replacement (the live name is
+// gone: put it back, the interrupted write simply did not happen) or rubbish
+// from a write that finished (drop it). A leftover "<path>.tmp" is a copy that
+// never installed: it is not a name any loader reads, and this write is about
+// to make its own. Either way both names are free afterwards, which is what
+// keeps a crash from blocking every later write to that file.
+static void storeTidy(const char* path) {
+  char old[80], tmp[80];
+  if (snprintf(old, sizeof(old), "%s.old", path) < (int)sizeof(old) &&
+      sdExists(old)) {
+    if (!sdExists(path) && fileRename(old, path))
+      logMsgf("Sys", ORANGE, "store: recovered %s from an interrupted write",
+              path);
+    else
+      fileRemove(old);
+  }
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) < (int)sizeof(tmp))
+    fileRemove(tmp);
+}
+
+// Does the file read back as exactly the bytes we meant to write? One pass, in
+// bounded chunks on the stack, against a buffer the caller already holds -- no
+// second plaintext-sized buffer, and the size is compared too, so a truncated
+// or extended copy fails here as well.
+static bool fileMatches(const char* path, const uint8_t* want, size_t n) {
+  uint8_t buf[128];
+  size_t off = 0;
+  bool ok = false;
+  if (!sdInit())
+    return false;
+  xSemaphoreTake(spiMux, portMAX_DELAY);
+  File f = SD.open(path, FILE_READ);
+  if (f && !f.isDirectory() && (size_t)f.size() == n) {
+    ok = true;
+    while (off < n) {
+      size_t chunk = (n - off) < sizeof(buf) ? (n - off) : sizeof(buf);
+      if (f.read(buf, chunk) != (int)chunk ||
+          memcmp(buf, want + off, chunk) != 0) {
+        ok = false;
+        break;
+      }
+      off += chunk;
+    }
+  }
+  if (f)
+    f.close();
+  xSemaphoreGive(spiMux);
+  return ok;
+}
+
+// The write half. Plaintext mode is today's write. Sealed mode is: seal, write
+// a temp, read the temp back and compare it byte for byte against the container
+// in storeCont, then install it over the real name -- moving the live file
+// aside first, so that a failure at any step leaves the previous file in place
+// rather than leaving the name empty (FAT rename does not reliably replace an
+// existing name, and "delete then rename" has a window in which there is no
+// identity file at all).
+//
+// What the read-back check proves, and what it does not: it proves the CARD --
+// the file exists, at the right size, holding exactly the container we just
+// sealed. It does NOT decrypt; that would need a plaintext-sized buffer for the
+// result, and this path deliberately has only two. The seal itself is covered
+// where it belongs: the module's own round-trip, tamper and truncation tests,
+// and the next boot's unseal, which is the first thing that has to work.
+static bool storeWrite(const char* path, const char* ctx, const uint8_t* in,
+                       size_t len) {
+  if (storeMode == STORE_PLAIN)
+    return fileWriteAll(path, in, len);
+  if (!storeKey.unlocked || len > STORE_PT_SZ)
+    return false;
+
+  char tmp[80], old[80];
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+      snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old))
+    return false;
+
+  storeTidy(path);
+
+  size_t clen = 0;
+  if (cc_store_seal(&storeKey, &rng, ctx, in, len, storeCont, sizeof(storeCont),
+                    &clen) != CC_STORE_OK) {
+    logMsg("Sys", "store: seal FAILED, file not written", RED);
+    return false;
+  }
+  {
+    // Self-check the header the next boot will read: length, algorithms, work
+    // factor and salt, against the key this was just sealed with. No buffer
+    // needed, so it survives the budget. What no check here can do is verify
+    // the GCM tag itself: that is deterministic over this key and this
+    // context, and the module's own round-trip, tamper and truncation tests
+    // pin it -- see the note above about what the read-back does not prove.
+    cc_store_info_t info;
+    if (cc_store_probe(storeCont, clen, &info) != CC_STORE_OK ||
+        info.plain_len != (uint32_t)len ||
+        info.iterations != storeKey.iterations ||
+        memcmp(storeCont + CC_STORE_OFF_SALT, storeKey.salt,
+               CC_STORE_SALT_SZ) != 0) {
+      logMsg("Sys", "store: sealed header is not what this key expects", RED);
+      return false;
+    }
+  }
+  if (!fileWriteAll(tmp, storeCont, clen)) {
+    logMsgf("Sys", RED, "store: write FAILED (%s)", tmp);
+    fileRemove(tmp);
+    return false;
+  }
+  if (!fileMatches(tmp, storeCont, clen)) {
+    logMsgf("Sys", RED, "store: %s does not read back, kept the old file", tmp);
+    fileRemove(tmp);
+    return false;
+  }
+
+  // Install. The live file is moved aside rather than deleted, so that a failed
+  // install can be undone and the name is never left empty.
+  bool hadOld = sdExists(path);
+  if (hadOld && !fileRename(path, old)) {
+    logMsgf("Sys", RED, "store: cannot move %s aside, not replaced", path);
+    fileRemove(tmp);
+    return false;
+  }
+  if (!fileRename(tmp, path)) {
+    if (hadOld && !fileRename(old, path))
+      logMsgf("Sys", RED, "store: %s left as %s", path, old);
+    logMsgf("Sys", RED, "store: install of %s FAILED", path);
+    fileRemove(tmp);
+    return false;
+  }
+  if (hadOld && !fileRemove(old))
+    logMsgf("Sys", ORANGE, "store: %s left behind", old);
   return true;
 }
 
@@ -960,24 +1273,28 @@ static uint32_t nextSeq() { return ++txSeq; }
 // revocation. Older payloads are still read (missing fields default to 0) so an
 // upgrade does not throw away the counter and start reusing it.
 static bool stateLoad() {
-  uint8_t b[11];
+  const uint8_t* b;
   size_t got = 0;
-  bool present = false;
   uint32_t claim = 0;
-  bool ok = sdAccess(STATE_FILE, FILE_READ, [&](File& f) {
-    present = true;
-    got = (size_t)f.size();
-    if (got != ENV_HDR_SZ + 6 && got != ENV_HDR_SZ + 10 &&
-        got != ENV_HDR_SZ + sizeof(b))
-      return false;
-    if (!envReadHeader(f, &claim))
-      return false;
+  bool present = false;
+  bool ok = false;
+  int rc;
+  // A locked store cannot be read at all: fall back to the RNG seed exactly as
+  // for a first boot, and say nothing here -- the boot path already explained
+  // why in the operator's words.
+  if (storeLocked())
+    return false;
+  rc = storeRead(STATE_FILE, STATE_FILE, storePlain, sizeof(storePlain), &got);
+  present = (rc != FILE_ST_ABSENT);
+  if (rc == FILE_ST_OK) {
+    b = storePlain + ENV_HDR_SZ;
     got -= ENV_HDR_SZ;
-    if (f.read(b, got) != got)
-      return false;
-    return crc32(b, got) == claim;
-  });
-  if (!ok || b[0] != 0xCC || (b[1] != 1 && b[1] != STATE_VERSION)) {
+    ok = (got == 6 || got == 10 || got == 11) &&
+         envReadHeader(storePlain, ENV_HDR_SZ, &claim) &&
+         crc32(b, got) == claim && b[0] == 0xCC &&
+         (b[1] == 1 || b[1] == STATE_VERSION);
+  }
+  if (!ok) {
     // Absent is a first boot and seeds from the RNG; present but invalid is
     // damage, and the fail-safe for a freshness counter is the same (treat it
     // as absent, reseed) -- but loudly, because the node will then reuse
@@ -991,7 +1308,7 @@ static bool stateLoad() {
   txSeq = (got >= 10) ? ((uint32_t)b[6] | ((uint32_t)b[7] << 8) |
                          ((uint32_t)b[8] << 16) | ((uint32_t)b[9] << 24))
                       : 0;
-  revocationPublished = (got == sizeof(b)) && (b[10] & 1) != 0;
+  revocationPublished = (got == 11) && (b[10] & 1) != 0;
   // Skip past values that may have been used since the last save: a peer's
   // window is CC_REPLAY_WINDOW wide and an announce seq only has to be greater
   // than the last one the peer stored, so a jump that size cannot repeat one
@@ -1011,32 +1328,31 @@ static bool stateLoad() {
   return true;
 }
 
-static void stateSave() {
+static bool stateSave() {
   lastStateTry = millis();
   if (!sdReady)
-    return;
+    return false;
   uint32_t c = txCounter, s = txSeq;
-  uint8_t b[11] = {0xCC,
-                   STATE_VERSION,
-                   (uint8_t)c,
-                   (uint8_t)(c >> 8),
-                   (uint8_t)(c >> 16),
-                   (uint8_t)(c >> 24),
-                   (uint8_t)s,
-                   (uint8_t)(s >> 8),
-                   (uint8_t)(s >> 16),
-                   (uint8_t)(s >> 24),
-                   (uint8_t)(revocationPublished ? 1 : 0)};
-  uint8_t hdr[ENV_HDR_SZ];
-  envWriteHeader(hdr, crc32(b, sizeof(b)));
-  if (!sdAccess(STATE_FILE, FILE_WRITE, [&](File& f) {
-        return f.write(hdr, ENV_HDR_SZ) == ENV_HDR_SZ &&
-               f.write(b, sizeof(b)) == sizeof(b);
-      }))
-    return; /* not saved: leave the saved markers alone so drift stays visible
-             */
+  uint8_t b[ENV_HDR_SZ + 11];
+  uint8_t payload[11] = {0xCC,
+                         STATE_VERSION,
+                         (uint8_t)c,
+                         (uint8_t)(c >> 8),
+                         (uint8_t)(c >> 16),
+                         (uint8_t)(c >> 24),
+                         (uint8_t)s,
+                         (uint8_t)(s >> 8),
+                         (uint8_t)(s >> 16),
+                         (uint8_t)(s >> 24),
+                         (uint8_t)(revocationPublished ? 1 : 0)};
+  envWriteHeader(b, crc32(payload, sizeof(payload)));
+  memcpy(b + ENV_HDR_SZ, payload, sizeof(payload));
+  if (!storeWrite(STATE_FILE, STATE_FILE, b, sizeof(b)))
+    return false; /* not saved: leave the saved markers alone so drift stays
+                     visible */
   txCounterSaved = c;
   txSeqSaved = s;
+  return true;
 }
 
 // Save once the cadence has elapsed, or once the counter or the announce seq
@@ -1059,25 +1375,23 @@ static void stateMaybeSave() {
 
 // Replay file payload: <version><unsigned cc_replay_t><authed cc_replay_t>,
 // wrapped in the envelope.
-static void replaySave(int i) {
+static bool replaySave(int i) {
   char path[64];
+  uint8_t buf[ENV_HDR_SZ + 1 + 2 * sizeof(cc_replay_t)];
   peerPath(peerAddrs[i], ".rp", path, sizeof(path));
   const cc_replay_t* un = &peerReplayUnsign[i];
   const cc_replay_t* au = &peerReplayAuthed[i];
   uint8_t ver = REPLAY_VERSION;
-  uint8_t hdr[ENV_HDR_SZ];
   uint32_t c = crc32Update(crc32Start(), &ver, 1);
   c = crc32Update(c, (const uint8_t*)un, sizeof(cc_replay_t));
   c = crc32Update(c, (const uint8_t*)au, sizeof(cc_replay_t));
-  envWriteHeader(hdr, crc32Finish(c));
-  sdAccess(path, FILE_WRITE, [&](File& f) {
-    f.write(hdr, ENV_HDR_SZ);
-    f.write(&ver, 1);
-    f.write((const uint8_t*)un, sizeof(cc_replay_t));
-    f.write((const uint8_t*)au, sizeof(cc_replay_t));
-    return true;
-  });
+  envWriteHeader(buf, crc32Finish(c));
+  buf[ENV_HDR_SZ] = ver;
+  memcpy(buf + ENV_HDR_SZ + 1, un, sizeof(cc_replay_t));
+  memcpy(buf + ENV_HDR_SZ + 1 + sizeof(cc_replay_t), au, sizeof(cc_replay_t));
+  bool ok = storeWrite(path, path, buf, sizeof(buf));
   peerReplaySavedAt[i] = millis();
+  return ok;
 }
 
 static void replayMaybeSave(int i) {
@@ -1099,32 +1413,31 @@ static void replayLoad(int i) {
   char path[64];
   peerPath(addr, ".rp", path, sizeof(path));
   bool present = false;
-  bool ok = sdAccess(path, FILE_READ, [&](File& f) {
-    present = true;
-    uint32_t claim = 0;
-    if (!envReadHeader(f, &claim))
-      return false;
-    uint8_t ver = 0;
-    if (f.read(&ver, 1) != 1 || ver != REPLAY_VERSION)
-      return false;
-    if (f.read((uint8_t*)&un, sizeof(un)) != sizeof(un))
-      return false;
-    if (f.read((uint8_t*)&au, sizeof(au)) != sizeof(au))
-      return false;
-    uint32_t c = crc32Update(crc32Start(), &ver, 1);
-    c = crc32Update(c, (const uint8_t*)&un, sizeof(un));
-    c = crc32Update(c, (const uint8_t*)&au, sizeof(au));
-    if (crc32Finish(c) != claim)
-      return false;
-    // A state that belongs to another peer, or carries the other class, would
-    // make every packet from this peer return CC_E_ARG: reject it and start
-    // from fresh windows instead of muting the peer.
-    if (memcmp(un.addr, addr, CC_ADDR_SZ) != 0 ||
-        memcmp(au.addr, addr, CC_ADDR_SZ) != 0 ||
-        un.cls != CC_REPLAY_UNSIGNED || au.cls != CC_REPLAY_AUTHED)
-      return false;
-    return true;
-  });
+  bool ok = false;
+  size_t got = 0;
+  uint32_t claim = 0;
+  if (!storeLocked()) {
+    int rc = storeRead(path, path, storePlain, sizeof(storePlain), &got);
+    present = (rc != FILE_ST_ABSENT);
+    if (rc == FILE_ST_OK &&
+        got == ENV_HDR_SZ + 1 + 2 * sizeof(cc_replay_t) &&
+        envReadHeader(storePlain, ENV_HDR_SZ, &claim) &&
+        storePlain[ENV_HDR_SZ] == REPLAY_VERSION) {
+      memcpy(&un, storePlain + ENV_HDR_SZ + 1, sizeof(un));
+      memcpy(&au, storePlain + ENV_HDR_SZ + 1 + sizeof(un), sizeof(au));
+      uint32_t c = crc32Update(crc32Start(), storePlain + ENV_HDR_SZ, 1);
+      c = crc32Update(c, (const uint8_t*)&un, sizeof(un));
+      c = crc32Update(c, (const uint8_t*)&au, sizeof(au));
+      ok = (crc32Finish(c) == claim);
+      // A state that belongs to another peer, or carries the other class, would
+      // make every packet from this peer return CC_E_ARG: reject it and start
+      // from fresh windows instead of muting the peer.
+      if (ok && (memcmp(un.addr, addr, CC_ADDR_SZ) != 0 ||
+                 memcmp(au.addr, addr, CC_ADDR_SZ) != 0 ||
+                 un.cls != CC_REPLAY_UNSIGNED || au.cls != CC_REPLAY_AUTHED))
+        ok = false;
+    }
+  }
   if (present && !ok) {
     char hex[CC_ADDR_SZ * 2 + 1];
     toHex(addr, 4, hex);
@@ -1156,72 +1469,94 @@ static void oldWireSeen() {
 // links, and looks to every peer like a stranger. The caller fails closed
 // instead (see setup()).
 static int keyLoad() {
-  static uint8_t ss[CC_SIGN_SEED_SZ], ks[CC_KEM_SEED_SZ];
-  static uint8_t sp[CC_SIGN_PRIVKEY_SZ], sb[CC_SIGN_PUBKEY_SZ],
-      kp[CC_KEM_PRIVKEY_SZ];
+  uint8_t* p;
+  uint8_t* sign_seed;
+  uint8_t* kem_seed;
+  uint8_t* sign_priv;
+  uint8_t* sign_pub;
+  uint8_t* kem_priv;
+  size_t got = 0;
+  int rc;
   if (!sdInit())
     return FILE_ST_NOCARD; /* no card is not an empty card (see setup()) */
-  bool present = false;
+  // A locked store is not readable at all, and that is not damage, so it is
+  // not reported as damage either: setup() has already said which it is.
+  if (storeLocked())
+    return FILE_ST_INVALID;
+  // The three answers carry over from the file read: no card, no file, or a
+  // file that is there and does not load -- and the last of those must never be
+  // papered over by minting (see the note above).
+  rc = storeRead(KEY_FILE, KEY_FILE, storePlain, sizeof(storePlain), &got);
+  if (rc != FILE_ST_OK)
+    return rc;
+
+  // The key's pieces are POINTED AT in the file image, not copied out of it:
+  // they are already in one buffer, and a second copy of an 8 KB private key
+  // would be RAM, and one more thing to wipe, for nothing. Each form sets its
+  // own pointers below, so none of them is ever formed outside the image.
+  p = storePlain;
+  sign_seed = NULL;
+  kem_seed = NULL;
+  sign_priv = NULL;
+  sign_pub = NULL;
+  kem_priv = NULL;
+
+  uint32_t claim = 0;
+  uint8_t form = 0;
   bool seed_form = false;
-  bool ok = sdAccess(KEY_FILE, FILE_READ, [&](File& f) {
-    present = true; /* it opened: a failure below is damage, not absence */
-    size_t want = (size_t)f.size();
-    if (want != (size_t)(ENV_HDR_SZ + KEY_SEED_PAYLOAD_SZ) &&
-        want != (size_t)(ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ))
-      return false;
-    uint32_t claim = 0;
-    if (!envReadHeader(f, &claim))
-      return false;
-    uint8_t form = 0;
-    if (f.read(&form, 1) != 1)
-      return false;
+  bool ok = false;
+  if (envReadHeader(p, got, &claim) &&
+      (got == (size_t)(ENV_HDR_SZ + KEY_SEED_PAYLOAD_SZ) ||
+       got == (size_t)(ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ))) {
+    size_t off = ENV_HDR_SZ;
+    form = p[off++];
     uint32_t c = crc32Update(crc32Start(), &form, 1);
     if (form == KEY_FORM_SEED) {
-      if (want != (size_t)(ENV_HDR_SZ + KEY_SEED_PAYLOAD_SZ))
-        return false;
-      // Trust each read, not just the file size.
-      if (f.read(ss, sizeof(ss)) != sizeof(ss))
-        return false;
-      if (f.read(ks, sizeof(ks)) != sizeof(ks))
-        return false;
-      if (f.read(sb, CC_SIGN_PUBKEY_SZ) != CC_SIGN_PUBKEY_SZ)
-        return false;
-      c = crc32Update(c, ss, sizeof(ss));
-      c = crc32Update(c, ks, sizeof(ks));
-      c = crc32Update(c, sb, CC_SIGN_PUBKEY_SZ);
-      seed_form = true;
+      // Trust each field, not just the file size.
+      ok = got == (size_t)(ENV_HDR_SZ + KEY_SEED_PAYLOAD_SZ) &&
+           got - off == CC_SIGN_SEED_SZ + CC_KEM_SEED_SZ + CC_SIGN_PUBKEY_SZ;
+      if (ok) {
+        sign_seed = p + off;
+        kem_seed = sign_seed + CC_SIGN_SEED_SZ;
+        sign_pub = kem_seed + CC_KEM_SEED_SZ;
+        c = crc32Update(c, sign_seed, CC_SIGN_SEED_SZ);
+        c = crc32Update(c, kem_seed, CC_KEM_SEED_SZ);
+        c = crc32Update(c, sign_pub, CC_SIGN_PUBKEY_SZ);
+        seed_form = true;
+        ok = crc32Finish(c) == claim;
+      }
     } else if (form == KEY_FORM_EXPANDED) {
-      if (want != (size_t)(ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ))
-        return false;
-      if (f.read(sp, CC_SIGN_PRIVKEY_SZ) != CC_SIGN_PRIVKEY_SZ)
-        return false;
-      if (f.read(sb, CC_SIGN_PUBKEY_SZ) != CC_SIGN_PUBKEY_SZ)
-        return false;
-      if (f.read(kp, CC_KEM_PRIVKEY_SZ) != CC_KEM_PRIVKEY_SZ)
-        return false;
-      c = crc32Update(c, sp, CC_SIGN_PRIVKEY_SZ);
-      c = crc32Update(c, sb, CC_SIGN_PUBKEY_SZ);
-      c = crc32Update(c, kp, CC_KEM_PRIVKEY_SZ);
-    } else {
-      return false; /* not a form this build ever wrote */
+      ok = got == (size_t)(ENV_HDR_SZ + KEY_EXP_PAYLOAD_SZ) &&
+           got - off ==
+               CC_SIGN_PRIVKEY_SZ + CC_SIGN_PUBKEY_SZ + CC_KEM_PRIVKEY_SZ;
+      if (ok) {
+        sign_priv = p + off;
+        sign_pub = sign_priv + CC_SIGN_PRIVKEY_SZ;
+        kem_priv = sign_pub + CC_SIGN_PUBKEY_SZ;
+        c = crc32Update(c, sign_priv, CC_SIGN_PRIVKEY_SZ);
+        c = crc32Update(c, sign_pub, CC_SIGN_PUBKEY_SZ);
+        c = crc32Update(c, kem_priv, CC_KEM_PRIVKEY_SZ);
+        ok = crc32Finish(c) == claim;
+      }
     }
-    return crc32Finish(c) == claim;
-  });
-  int rc = FILE_ST_INVALID;
-  if (!present) {
-    rc = FILE_ST_ABSENT;
-  } else if (ok) {
-    bool imported = seed_form ? (cc_key_import_seed(&myKey, ss, ks) == CC_OK)
-                              : (cc_key_import(&myKey, sp, sb, kp) == CC_OK);
+    /* Any other form falls through as a failure: not a form this build wrote. */
+  }
+
+  rc = FILE_ST_INVALID;
+  if (ok) {
+    bool imported =
+        seed_form
+            ? (cc_key_import_seed(&myKey, sign_seed, kem_seed) == CC_OK)
+            : (cc_key_import(&myKey, sign_priv, sign_pub, kem_priv) == CC_OK);
     if (imported) {
       // Cross-check the sign half, in BOTH forms: the key must hold the signing
       // key whose public half is the `sign_pub` stored beside it, or this node
       // would announce one public key and sign with another (mute, and looking
-      // healthy). `sp` is the scratch for the derived public half: on the seed
-      // path it holds no sign_priv, and on the expanded path the import has
-      // already copied it into the key, so the two are never live at once.
-      imported = cc_key_export_public(&myKey, sp, kp) == CC_OK &&
-                 memcmp(sp, sb, CC_SIGN_PUBKEY_SZ) == 0;
+      // healthy). The derived public key is sunk into storeCont: the container
+      // it held has been opened already and is not needed again.
+      imported = cc_key_export_public(&myKey, storeCont,
+                                      storeCont + CC_SIGN_PUBKEY_SZ) == CC_OK &&
+                 memcmp(storeCont, sign_pub, CC_SIGN_PUBKEY_SZ) == 0;
     }
     if (imported) {
       rc = FILE_ST_OK;
@@ -1230,11 +1565,9 @@ static int keyLoad() {
       rc = FILE_ST_INVALID;
     }
   }
-  wipe(ss, sizeof(ss));
-  wipe(ks, sizeof(ks));
-  wipe(sp, sizeof(sp));
-  wipe(sb, sizeof(sb));
-  wipe(kp, sizeof(kp));
+  // The identity file in the clear, in RAM: gone the moment it has been used.
+  // Wiping the image covers the seeds and the expanded private halves with it.
+  wipe(storePlain, got);
   return rc;
 }
 
@@ -1242,60 +1575,79 @@ static int keyLoad() {
 // one this node generated), and in the expanded form when it does not. Returns
 // true only when the file was written.
 static bool keySave() {
-  static uint8_t ss[CC_SIGN_SEED_SZ], ks[CC_KEM_SEED_SZ];
-  static uint8_t sp[CC_SIGN_PRIVKEY_SZ], kp[CC_KEM_PRIVKEY_SZ];
-  static uint8_t sb[CC_SIGN_PUBKEY_SZ], kb[CC_KEM_PUBKEY_SZ];
-  uint8_t hdr[ENV_HDR_SZ];
+  // The image is assembled IN the plaintext buffer, and every export writes
+  // straight into the slot it belongs in, so this saver needs no scratch of its
+  // own: the only outputs with no slot in the file are the public halves the
+  // file does not carry (kem_pub, and sign_pub on the seed path), and those go
+  // into storeCont, which is free until storeWrite seals this image into it.
+  uint8_t* img = storePlain;
+  uint8_t* kb = storeCont + CC_SIGN_PRIVKEY_SZ +
+                CC_SIGN_PUBKEY_SZ; /* kem_pub: not stored */
+  size_t payload = 0;              /* bytes after the form byte */
   uint8_t form = 0;
-  uint32_t c = crc32Start();
   bool ok = false;
-  if (cc_key_export_private(&myKey, sp, kp) != CC_OK ||
-      cc_key_export_public(&myKey, sb, kb) != CC_OK) {
+  int sr;
+
+  // Both halves must export for a save to be attempted at all, in either form:
+  // the gate the previous revision had, kept as it was (its results are unused
+  // here and are overwritten below by the exports that do land in the image).
+  if (cc_key_export_private(&myKey, storeCont,
+                            storeCont + CC_SIGN_PRIVKEY_SZ) != CC_OK ||
+      cc_key_export_public(&myKey, storeCont + CC_SIGN_PRIVKEY_SZ, kb) !=
+          CC_OK) {
     logMsg("Sys", "key export FAILED: not saved", RED);
-  } else {
-    int sr = cc_key_export_seed(&myKey, ss, ks);
-    if (sr == CC_OK) {
-      form = KEY_FORM_SEED;
-      c = crc32Update(c, &form, 1);
-      c = crc32Update(c, ss, sizeof(ss));
-      c = crc32Update(c, ks, sizeof(ks));
-      c = crc32Update(c, sb, CC_SIGN_PUBKEY_SZ);
-    } else if (sr == CC_E_NOKEY) {
-      // Usable identity, no knowable seed (it was imported expanded). Save it
-      // the only way it can be saved, and say so: it is ~3.9 KB larger, but
-      // saving nothing here would leave the PREVIOUS identity on the card while
-      // this node announces the new one.
-      form = KEY_FORM_EXPANDED;
-      logMsg("Sys", "key has no seed: saving the expanded form", ORANGE);
-      c = crc32Update(c, &form, 1);
-      c = crc32Update(c, sp, CC_SIGN_PRIVKEY_SZ);
-      c = crc32Update(c, sb, CC_SIGN_PUBKEY_SZ);
-      c = crc32Update(c, kp, CC_KEM_PRIVKEY_SZ);
-    } else {
-      logMsgf("Sys", RED, "key export failed (%d): not saved", sr);
-    }
-    if (form != 0) {
-      envWriteHeader(hdr, crc32Finish(c));
-      ok = sdAccess(KEY_FILE, FILE_WRITE, [&](File& f) {
-        if (f.write(hdr, ENV_HDR_SZ) != ENV_HDR_SZ || f.write(&form, 1) != 1)
-          return false;
-        if (form == KEY_FORM_SEED) {
-          return f.write(ss, sizeof(ss)) == sizeof(ss) &&
-                 f.write(ks, sizeof(ks)) == sizeof(ks) &&
-                 f.write(sb, CC_SIGN_PUBKEY_SZ) == CC_SIGN_PUBKEY_SZ;
-        }
-        return f.write(sp, CC_SIGN_PRIVKEY_SZ) == CC_SIGN_PRIVKEY_SZ &&
-               f.write(sb, CC_SIGN_PUBKEY_SZ) == CC_SIGN_PUBKEY_SZ &&
-               f.write(kp, CC_KEM_PRIVKEY_SZ) == CC_KEM_PRIVKEY_SZ;
-      });
-    }
+    wipe(storePlain, sizeof(storePlain));
+    wipe(storeCont, CC_SIGN_PRIVKEY_SZ + CC_SIGN_PUBKEY_SZ + CC_KEM_PUBKEY_SZ);
+    return false;
   }
-  wipe(ss, sizeof(ss));
-  wipe(ks, sizeof(ks));
-  wipe(sp, sizeof(sp));
-  wipe(sb, sizeof(sb));
-  wipe(kp, sizeof(kp));
-  wipe(kb, sizeof(kb));
+
+  sr = cc_key_export_seed(&myKey, img + ENV_HDR_SZ + 1,
+                          img + ENV_HDR_SZ + 1 + CC_SIGN_SEED_SZ);
+  if (sr == CC_OK) {
+    // The seed form this build writes.
+    form = KEY_FORM_SEED;
+    payload = CC_SIGN_SEED_SZ + CC_KEM_SEED_SZ + CC_SIGN_PUBKEY_SZ;
+    // sign_pub comes from the key, not from the seed, and it belongs in the
+    // image: export it straight into its slot.
+    if (cc_key_export_public(
+            &myKey, img + ENV_HDR_SZ + 1 + CC_SIGN_SEED_SZ + CC_KEM_SEED_SZ,
+            kb) != CC_OK) {
+      logMsg("Sys", "key export FAILED: not saved", RED);
+      form = 0;
+    }
+  } else if (sr == CC_E_NOKEY) {
+    // Usable identity, no knowable seed (it was imported expanded). Save it the
+    // only way it can be saved, and say so: it is ~3.9 KB larger, but saving
+    // nothing here would leave the PREVIOUS identity on the card while this
+    // node announces the new one.
+    form = KEY_FORM_EXPANDED;
+    logMsg("Sys", "key has no seed: saving the expanded form", ORANGE);
+    payload = CC_SIGN_PRIVKEY_SZ + CC_SIGN_PUBKEY_SZ + CC_KEM_PRIVKEY_SZ;
+    if (cc_key_export_private(&myKey, img + ENV_HDR_SZ + 1,
+                              img + ENV_HDR_SZ + 1 + CC_SIGN_PRIVKEY_SZ +
+                                  CC_SIGN_PUBKEY_SZ) != CC_OK ||
+        cc_key_export_public(&myKey,
+                             img + ENV_HDR_SZ + 1 + CC_SIGN_PRIVKEY_SZ,
+                             kb) != CC_OK) {
+      logMsg("Sys", "key export FAILED: not saved", RED);
+      form = 0;
+    }
+  } else {
+    logMsgf("Sys", RED, "key export failed (%d): not saved", sr);
+  }
+
+  if (form != 0) {
+    // One contiguous image: envelope, form byte, then the key bytes, exactly
+    // the file a plaintext card would hold. The CRC covers the form byte and
+    // the payload, so it is computed once the payload is in place.
+    img[ENV_HDR_SZ] = form;
+    envWriteHeader(img, crc32(img + ENV_HDR_SZ, 1 + payload));
+    ok = storeWrite(KEY_FILE, KEY_FILE, img, ENV_HDR_SZ + 1 + payload);
+  }
+  // The image is a private key in the clear, and storePlain is also the store's
+  // read buffer: wipe it, and the scratch exports in the container buffer too.
+  wipe(storePlain, sizeof(storePlain));
+  wipe(storeCont, CC_SIGN_PRIVKEY_SZ + CC_SIGN_PUBKEY_SZ + CC_KEM_PUBKEY_SZ);
   return ok;
 }
 
@@ -1469,7 +1821,7 @@ static void requestAnnounce(const uint8_t addr[CC_ADDR_SZ]) {
 // defence.
 // ---------------------------------------------------------------------------
 static cc_link_t* linkFind(const uint8_t id[CC_LINK_ID_SZ]) {
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     if (links[i].used && memcmp(links[i].id, id, CC_LINK_ID_SZ) == 0)
       return &links[i];
   }
@@ -1477,7 +1829,7 @@ static cc_link_t* linkFind(const uint8_t id[CC_LINK_ID_SZ]) {
 }
 
 static cc_link_t* linkFindPeer(const uint8_t addr[CC_ADDR_SZ]) {
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     if (links[i].used && memcmp(links[i].peer, addr, CC_ADDR_SZ) == 0)
       return &links[i];
   }
@@ -1497,7 +1849,7 @@ static bool linkPeerKnown(const cc_link_t* l) {
 
 static int linkCountRole(uint8_t role) {
   int n = 0;
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     if (links[i].used && links[i].role == role)
       n++;
   }
@@ -1533,7 +1885,7 @@ static void pendForget(int i) { cc_link_forget(&linkPend[i]); }
 // unanswered handshake included).
 static cc_link_t* linkAlloc() {
   uint32_t now = millis();
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     if (!links[i].used)
       return &links[i];
     if ((int32_t)(now - links[i].last_seen) > (int32_t)LINK_IDLE_MS) {
@@ -1599,7 +1951,7 @@ static void linkMaintain() {
   if (!haveIdentity)
     return;
   uint32_t now = millis();
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     cc_link_t* l = &links[i];
     if (!l->used)
       continue;
@@ -1780,29 +2132,31 @@ static bool sdRemove(const char* path) {
 static void revokedLoad() {
   for (int i = 0; i < REVOKED_MAX; i++) cc_revoked_init(&revoked[i]);
   static cc_revoked_t scratch[REVOKED_MAX]; /* no heap; see the RAM note */
-  uint8_t ver = 0;
   bool present = false;
-  bool ok = sdAccess(REVOKED_FILE, FILE_READ, [&](File& f) {
-    present = true; /* it opened: a failure below is content, not absence */
-    uint32_t claim = 0;
-    if (!envReadHeader(f, &claim))
-      return false;
-    if ((size_t)f.size() != ENV_HDR_SZ + 1 + REVOKED_MAX * sizeof(cc_revoked_t))
-      return false; /* short or oversized: do not install a prefix */
-    if (f.read(&ver, 1) != 1 || ver != REVOKED_VERSION)
-      return false;
-    if (f.read((uint8_t*)scratch, sizeof(scratch)) != sizeof(scratch))
-      return false;
-    uint32_t c = crc32Update(crc32Start(), &ver, 1);
+  bool ok = false;
+  size_t got = 0;
+  uint32_t claim = 0;
+  const size_t want = ENV_HDR_SZ + 1 + REVOKED_MAX * sizeof(cc_revoked_t);
+  // A locked store cannot be read: fail closed (an unread revocation list is
+  // not a reason to trust a retired identity) and stay quiet -- the boot
+  // already said why.
+  if (storeLocked())
+    return;
+  int rc = storeRead(REVOKED_FILE, REVOKED_FILE, storePlain,
+                     sizeof(storePlain), &got);
+  present = (rc != FILE_ST_ABSENT);
+  if (rc == FILE_ST_OK && got == want &&
+      envReadHeader(storePlain, ENV_HDR_SZ, &claim) &&
+      storePlain[ENV_HDR_SZ] == REVOKED_VERSION) {
+    memcpy(scratch, storePlain + ENV_HDR_SZ + 1, sizeof(scratch));
+    uint32_t c = crc32Update(crc32Start(), storePlain + ENV_HDR_SZ, 1);
     c = crc32Update(c, (const uint8_t*)scratch, sizeof(scratch));
-    if (crc32Finish(c) != claim)
-      return false;
-    for (int i = 0; i < REVOKED_MAX; i++) {
+    ok = (crc32Finish(c) == claim);
+    for (int i = 0; ok && i < REVOKED_MAX; i++) {
       if (scratch[i].used > 1)
-        return false; /* not a record this app ever wrote */
+        ok = false; /* not a record this app ever wrote */
     }
-    return true;
-  });
+  }
   if (!ok) {
     if (present)
       logMsg("Sys", "revoked.bin invalid: list NOT loaded", ORANGE);
@@ -1811,18 +2165,15 @@ static void revokedLoad() {
   for (int i = 0; i < REVOKED_MAX; i++) revoked[i] = scratch[i];
 }
 
-static void revokedSave() {
+static bool revokedSave() {
+  uint8_t buf[ENV_HDR_SZ + 1 + REVOKED_MAX * sizeof(cc_revoked_t)];
   uint8_t ver = REVOKED_VERSION;
-  uint8_t hdr[ENV_HDR_SZ];
   uint32_t c = crc32Update(crc32Start(), &ver, 1);
   c = crc32Update(c, (const uint8_t*)revoked, sizeof(revoked));
-  envWriteHeader(hdr, crc32Finish(c));
-  sdAccess(REVOKED_FILE, FILE_WRITE, [&](File& f) {
-    f.write(hdr, ENV_HDR_SZ);
-    f.write(&ver, 1);
-    f.write((const uint8_t*)revoked, sizeof(revoked));
-    return true;
-  });
+  envWriteHeader(buf, crc32Finish(c));
+  buf[ENV_HDR_SZ] = ver;
+  memcpy(buf + ENV_HDR_SZ + 1, revoked, sizeof(revoked));
+  return storeWrite(REVOKED_FILE, REVOKED_FILE, buf, sizeof(buf));
 }
 
 // Record a verified retirement. Security records are NOT a cache: a live
@@ -1914,7 +2265,7 @@ static void peerRemove(int i) {
 // working. Pending handshakes carry no peer address (link_req is anonymous), so
 // there is nothing to match there; they expire on their own TTL.
 static void linkDropPeer(const uint8_t addr[CC_ADDR_SZ]) {
-  for (int i = 0; i < LINK_MAX; i++) {
+  for (int i = 0; i < LINK_SESSION_MAX; i++) {
     if (links[i].used && memcmp(links[i].peer, addr, CC_ADDR_SZ) == 0)
       cc_link_forget(&links[i]);
   }
@@ -1942,7 +2293,7 @@ static void rekeyPeer(int i, const cc_announce_t* rot, uint32_t floorAuthed,
   replaySave(i);
   // A link's keys are independent of the identity keys, so a rotation does not
   // invalidate an open session; the link just follows the address change.
-  for (int j = 0; j < LINK_MAX; j++) {
+  for (int j = 0; j < LINK_SESSION_MAX; j++) {
     if (links[j].used && memcmp(links[j].peer, oldAddr, CC_ADDR_SZ) == 0)
       memcpy(links[j].peer, rot->addr, CC_ADDR_SZ);
   }
@@ -2059,6 +2410,389 @@ static void publishRotation() {
 }
 
 // ---------------------------------------------------------------------------
+// The store's operator-facing half: the passphrase prompt, the boot decision,
+// and the command that sets or changes the passphrase.
+//
+// There is NO recovery here, by design: the key is PBKDF2(passphrase, salt) and
+// nothing else, so a forgotten passphrase means the sealed files are gone and
+// the only way back is 'w' (wipe) followed by 'n' (mint). Nothing in this file
+// may grow a hint, an escrow, a recovery phrase, or a second path to the key.
+// ---------------------------------------------------------------------------
+#define STORE_UNLOCK_TRIES 3
+// A prompt with no keyboard input at all must not brick the boot: after this
+// long the prompt gives up and leaves the caller in its fail-safe state.
+#define STORE_PROMPT_MS 120000UL
+
+// Read a secret from the keyboard, echoing a mask and nothing else. The
+// passphrase never reaches inputBuf (which drawInput() puts on screen), never
+// reaches logMsg, and is wiped by the caller. False means the operator could
+// not be asked at all, which must leave the caller fail-safe rather than
+// pretending an answer arrived.
+static bool promptSecret(const char* label, char* out, size_t cap) {
+  auto& D = M5Cardputer.Display;
+  uint32_t started = millis();
+  size_t len = 0;
+  int y = D.height() - 14;
+  out[0] = '\0';
+  while ((uint32_t)(millis() - started) < STORE_PROMPT_MS) {
+    M5Cardputer.update();
+    if (!M5Cardputer.Keyboard.isChange() ||
+        !M5Cardputer.Keyboard.isPressed()) {
+      delay(20);
+      continue;
+    }
+    auto ks = M5Cardputer.Keyboard.keysState();
+    bool done = false;
+    for (auto k : ks.word) {
+      if (k == '\t')
+        continue;
+      if (len + 1 < cap)
+        out[len++] = k;
+    }
+    if (ks.del && len > 0)
+      len--;
+    if (ks.enter)
+      done = true;
+    out[len] = '\0';
+    // Only the prompt and a mask: the number of characters is visible, the
+    // characters are not.
+    D.fillRect(0, y, D.width(), 14, BLACK);
+    D.setCursor(2, y + 3);
+    D.setTextColor(YELLOW);
+    D.print(label);
+    D.print(": ");
+    D.setTextColor(WHITE);
+    for (size_t i = 0; i < len && i < 24; i++) D.print('*');
+    if (done)
+      return true;
+  }
+  logMsg("Sys", "passphrase prompt timed out", ORANGE);
+  // Whatever was typed is a partial passphrase: it is the caller's buffer, and
+  // the caller cannot know how much of it was written, so it goes now.
+  wipe(out, cap);
+  return false;
+}
+
+// Adopt a passphrase the operator just typed as the card's store key. An empty
+// passphrase means "run this card in the clear": that is a choice, never a
+// default, so the caller warns about it.
+static bool storeAdoptPassphrase(const char* pass) {
+  cc_store_lock(&storeKey);
+  if (pass[0] == '\0') {
+    // An empty answer is "run this card in the clear". It is a choice, so it
+    // gets said out loud -- at every place that can take it -- rather than
+    // being taken silently.
+    storeMode = STORE_PLAIN;
+    logMsg("Sys", "store PLAINTEXT: no passphrase set", ORANGE);
+    logMsg("Sys", "key.bin will be readable by anyone with the card", RED);
+    return true;
+  }
+  logMsg("Sys", "deriving key (PBKDF2, slow on this part)...", ORANGE);
+  if (cc_store_new_key(&storeKey, &rng, 0, (const uint8_t*)pass, strlen(pass)) !=
+      CC_STORE_OK) {
+    cc_store_lock(&storeKey);
+    logMsg("Sys", "store: key derivation FAILED", RED);
+    return false;
+  }
+  storeMode = STORE_SEALED;
+  return true;
+}
+
+// Ask for a new passphrase, and ask again to confirm it. allowEmpty is the
+// fresh-card boot question ("no passphrase" is a legitimate answer there); the
+// 'p' command refuses it, because that is not a way to remove a store that
+// already exists -- 'w' erases the card, and removing the passphrase while
+// keeping the identity is a silently weaker card.
+static bool storePromptNew(const char* label, bool allowEmpty) {
+  char a[CC_STORE_PASS_MAX + 1], b[CC_STORE_PASS_MAX + 1];
+  bool ok = false;
+  b[0] = '\0';
+  if (!promptSecret(label, a, sizeof(a))) {
+    // The prompt wiped a partial answer already; this covers the array itself.
+    wipe(a, sizeof(a));
+    return false;
+  }
+  if (a[0] == '\0') {
+    if (!allowEmpty)
+      logMsg("Sys", "empty passphrase refused ('w' erases the card)", RED);
+    else
+      ok = storeAdoptPassphrase(a);
+  } else if (!promptSecret("again", b, sizeof(b))) {
+    ok = false;
+  } else if (strcmp(a, b) != 0) {
+    logMsg("Sys", "passphrases differ: nothing changed", RED);
+  } else {
+    ok = storeAdoptPassphrase(a);
+  }
+  wipe(a, sizeof(a));
+  wipe(b, sizeof(b));
+  return ok;
+}
+
+// Prove the CURRENT passphrase before replacing the key. An unlocked store only
+// means the passphrase was typed at boot, and the operator may have walked away
+// from the device since; opening key.bin with it is the proof that costs
+// nothing and weakens nothing.
+static bool storeConfirmCurrent() {
+  char pass[CC_STORE_PASS_MAX + 1];
+  cc_store_key_t probe;
+  size_t clen = 0, pt = 0;
+  bool ok = false;
+  if (!promptSecret("current passphrase", pass, sizeof(pass))) {
+    wipe(pass, sizeof(pass)); /* the prompt wiped it; this covers the array */
+    return false;
+  }
+  if (fileReadAll(KEY_FILE, storeCont, sizeof(storeCont), &clen) != FILE_ST_OK) {
+    logMsg("Sys", "key.bin unreadable: not re-keyed", RED);
+    wipe(pass, sizeof(pass));
+    return false;
+  }
+  logMsg("Sys", "deriving key (PBKDF2, slow on this part)...", ORANGE);
+  memset(&probe, 0, sizeof(probe));
+  ok = cc_store_unlock(&probe, KEY_FILE, storeCont, clen,
+                       (const uint8_t*)pass, strlen(pass), storePlain,
+                       sizeof(storePlain), &pt) == CC_STORE_OK;
+  cc_store_lock(&probe);
+  wipe(&probe, sizeof(probe));
+  wipe(storePlain, sizeof(storePlain)); /* the identity file in the clear */
+  wipe(pass, sizeof(pass));
+  if (!ok)
+    logMsg("Sys", "passphrase not accepted: nothing changed", RED);
+  return ok;
+}
+
+// Write every sealed kind again from the state in RAM: the peer windows, the
+// revocation list, the counter, and the identity LAST -- key.bin is the file
+// that decides the mode at the next boot, so the card never claims to be sealed
+// before the other files are.
+static bool storeSealAll() {
+  for (int i = 0; i < peerCount; i++) {
+    if (!replaySave(i))
+      return false;
+  }
+  return revokedSave() && stateSave() && keySave();
+}
+
+// Put the card back the way it was after a failed rewrite: the same files, from
+// the same RAM state, under whichever key and mode the caller restored first.
+// A failed passphrase change must leave a working card, not half of one.
+static bool storeRestoreAll() {
+  bool ok = true;
+  for (int i = 0; i < peerCount; i++) {
+    if (!replaySave(i))
+      ok = false;
+  }
+  if (!revokedSave())
+    ok = false;
+  if (!stateSave())
+    ok = false;
+  if (haveIdentity && !keySave())
+    ok = false;
+  if (!ok)
+    logMsg("Sys", "ROLLBACK INCOMPLETE: 'w' then 'n' makes a new identity", RED);
+  return ok;
+}
+
+// Console 'p': set the passphrase (sealing a plaintext card: the migration) or
+// change it (re-keying a sealed one).
+static void setPassphrase() {
+  int wasMode;
+  cc_store_key_t wasKey;
+
+  if (!sdReady) {
+    logMsg("Sys", "no card: nothing to seal", RED);
+    return;
+  }
+  if (!haveIdentity) {
+    logMsg("Sys", "no identity loaded: nothing to seal", RED);
+    logMsg("Sys", "'w' wipes, 'n' mints a new identity", ORANGE);
+    return;
+  }
+  if (storeLocked()) {
+    logMsg("Sys", "store LOCKED: 'w' wipes and 'n' mints a new identity", RED);
+    return;
+  }
+  // A sealed store insists on the passphrase it is sealed with before this
+  // command replaces the key.
+  if (storeMode == STORE_SEALED && !storeConfirmCurrent())
+    return;
+
+  // What a rollback needs: the mode and a copy of the key in use.
+  wasMode = storeMode;
+  memcpy(&wasKey, &storeKey, sizeof(wasKey));
+  if (!storePromptNew("new passphrase", false)) {
+    wipe(&wasKey, sizeof(wasKey));
+    return; /* nothing typed, or nothing agreed: the card is untouched */
+  }
+
+  logMsg("Sys", "sealing every file...", ORANGE);
+  if (storeSealAll()) {
+    cc_store_lock(&wasKey);
+    wipe(&wasKey, sizeof(wasKey));
+    if (wasMode == STORE_PLAIN) {
+      logMsg("Sys", "store SEALED: card migrated", GREEN);
+    } else {
+      logMsg("Sys", "store re-keyed", GREEN);
+    }
+    logMsg("Sys", "no recovery: forget it and 'w' then 'n' is the only way",
+           RED);
+    return;
+  }
+
+  // Half a rewrite is not a state this card may be left in: put the previous
+  // key and mode back and write every file again.
+  storeMode = wasMode;
+  memcpy(&storeKey, &wasKey, sizeof(storeKey));
+  wipe(&wasKey, sizeof(wasKey));
+  logMsg("Sys", "sealing FAILED: restoring the previous files", RED);
+  storeRestoreAll();
+}
+
+// Is any of the other sealed kinds a container? Asked only when key.bin is
+// missing, to tell "this was a sealed card" from "this was a plaintext card":
+// without it, minting a replacement identity for a sealed card whose key file
+// was lost would silently write the new private key in the clear.
+static bool storeAnySealed() {
+  static const char* const paths[] = {STATE_FILE, REVOKED_FILE};
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    cc_store_info_t info;
+    if (fileReadAll(paths[i], storeCont, sizeof(storeCont), &n) == FILE_ST_OK &&
+        cc_store_probe(storeCont, n, &info) == CC_STORE_OK)
+      return true;
+  }
+  return false;
+}
+
+// The boot half: decide the mode, and get the key before anything reads the
+// card. Called from setup() between the display setup and keyLoad(), because
+// the console only goes live in loop() while broadcastAnnounce() already fires
+// at the end of setup(): a prompt anywhere else would mean the node had read a
+// locked store, and announced, without ever asking.
+static void storeBoot() {
+  cc_store_info_t info;
+  size_t n = 0;
+  int rc, probe;
+  static const char* const fixed[] = {KEY_FILE, STATE_FILE, REVOKED_FILE};
+  if (!sdInit())
+    return; /* keyLoad() reports the cardless case, as it always has */
+
+  // Undo an interrupted sealed replacement before anything reads these files:
+  // a crash between the two renames leaves the live name empty and the previous
+  // copy at "<path>.old", and putting it back is the honest recovery (the
+  // interrupted write simply did not happen).
+  for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
+    storeTidy(fixed[i]);
+
+  rc = fileReadAll(KEY_FILE, storeCont, sizeof(storeCont), &n);
+  if (rc == FILE_ST_ABSENT) {
+    // No identity file. On a card with no state this is a fresh card, and the
+    // passphrase is asked for BEFORE the first private key exists, so a key is
+    // never written in the clear even for a moment. On a card that HAS state, a
+    // missing key file is damage or a hand-deleted file, not a fresh start: no
+    // prompt may turn it into a new identity (keyLoad() fails closed), and
+    // nothing is asked now either.
+    if (cardHasState() == FILE_ST_ABSENT) {
+      if (storePromptNew("new passphrase (empty = plaintext)", true) &&
+          storeMode == STORE_SEALED)
+        logMsg("Sys", "store SEALED: no recovery if it is forgotten", ORANGE);
+      return;
+    }
+    // If that state is sealed, this WAS a sealed card: remember it, so a later
+    // 'n' asks for a passphrase instead of quietly writing the replacement
+    // identity in the clear.
+    if (storeAnySealed()) {
+      storeMode = STORE_SEALED;
+      logMsg("Sys", "store SEALED: key.bin missing, files not readable", RED);
+    }
+    return;
+  }
+  if (rc != FILE_ST_OK)
+    return; /* unreadable: keyLoad() reports INVALID and the node fails closed */
+
+  probe = cc_store_probe(storeCont, n, &info);
+  if (probe == CC_STORE_E_VERSION) {
+    // A container this firmware does not understand is not a plaintext card:
+    // staying sealed (and locked) makes keyLoad() refuse, which is the honest
+    // answer for a store written by a newer build.
+    storeMode = STORE_SEALED;
+    logMsg("Sys", "store: newer format than this firmware", RED);
+    return;
+  }
+  if (probe != CC_STORE_OK) {
+    // Not a container. Is it one of OUR plaintext files? That is recognisable:
+    // the envelope every plaintext card wrote (magic + version). If it is, this
+    // is a card from before the store existed: run it exactly as such a card
+    // always ran, and say how to seal it.
+    if (n >= ENV_HDR_SZ && memcmp(storeCont, ENV_MAGIC, 4) == 0 &&
+        storeCont[4] == ENV_VERSION) {
+      storeMode = STORE_PLAIN;
+      logMsg("Sys", "store PLAINTEXT: 'p' sets a passphrase", ORANGE);
+      return;
+    }
+    // Neither: damaged, half-written, or a file from something else. Saying
+    // "PLAINTEXT" here would misstate the node's posture, and offering the
+    // passphrase or migration prompt for a file nothing can read would be
+    // worse. Mode stays plaintext so keyLoad() reaches its normal INVALID
+    // answer and the node fails closed, exactly as a damaged key file always
+    // has; only the wording knows the difference.
+    storeDamaged = true;
+    storeMode = STORE_PLAIN;
+    logMsg("Sys", "key.bin UNREADABLE: not a store, not a plaintext file", RED);
+    return;
+  }
+
+  storeMode = STORE_SEALED;
+  logMsg("Sys", "store SEALED: key.bin needs the passphrase", ORANGE);
+  {
+    char pass[CC_STORE_PASS_MAX + 1];
+    size_t clen = 0, pt = 0;
+    for (int tries = 1; tries <= STORE_UNLOCK_TRIES; tries++) {
+      if (!promptSecret("passphrase", pass, sizeof(pass)))
+        break;
+      if (pass[0] == '\0') {
+        logMsgf("Sys", ORANGE, "empty passphrase (%d of %d)", tries,
+                STORE_UNLOCK_TRIES);
+        continue;
+      }
+      if (fileReadAll(KEY_FILE, storeCont, sizeof(storeCont), &clen) !=
+          FILE_ST_OK)
+        break;
+      logMsg("Sys", "deriving key (PBKDF2, slow on this part)...", ORANGE);
+      rc = cc_store_unlock(&storeKey, KEY_FILE, storeCont, clen,
+                           (const uint8_t*)pass, strlen(pass), storePlain,
+                           sizeof(storePlain), &pt);
+      wipe(pass, sizeof(pass));
+      wipe(storePlain, sizeof(storePlain)); /* the identity in the clear */
+      if (rc == CC_STORE_OK) {
+        logMsg("Sys", "store unlocked", GREEN);
+        return;
+      }
+      logMsgf("Sys", ORANGE, "passphrase not accepted (%d of %d)", tries,
+              STORE_UNLOCK_TRIES);
+    }
+    wipe(pass, sizeof(pass));
+    // Fail closed, and never mint: three failed attempts are exactly as
+    // unreadable as a damaged key file, and re-identifying the node over a typo
+    // would be the worst possible answer to one.
+    cc_store_lock(&storeKey);
+    logMsg("Sys", "store LOCKED: key.bin was not read", RED);
+    logMsg("Sys", "'w' wipes the card, 'n' mints a new identity", RED);
+  }
+}
+
+// A locked store has no key, so a new identity would have nowhere sealed to go.
+// Ask for a passphrase decision before writing one, rather than silently
+// writing a new private key in the clear.
+static void storeAskIfLocked() {
+  if (storeMode != STORE_SEALED || storeKey.unlocked || !sdReady)
+    return;
+  if (storePromptNew("new passphrase (empty = plaintext)", true) &&
+      storeMode == STORE_SEALED)
+    logMsg("Sys", "store keyed: no recovery if it is forgotten", ORANGE);
+}
+
+// ---------------------------------------------------------------------------
 // Identity lifecycle: mint a new one ('n') and wipe the card ('w'). Both act
 // only after a confirmation keypress, because neither can be undone from here.
 // ---------------------------------------------------------------------------
@@ -2069,6 +2803,12 @@ static void publishRotation() {
 // orphaned on the peers' side. This is what recovery from a damaged key file
 // looks like.
 static void mintNewIdentity() {
+  // A locked store (unknown passphrase, or a card just wiped) has no key: the
+  // new private key would have nowhere sealed to go. Ask before minting, so the
+  // answer is the operator's and the file is never silently written in the
+  // clear. On a sealed card that is still unlocked the passphrase has not
+  // changed, so nothing is asked and the new identity is sealed under it.
+  storeAskIfLocked();
   if (cc_key_generate(&myKey, &rng) != CC_OK) {
     logMsg("Sys", "keygen FAILED", RED);
     return;
@@ -2127,6 +2867,22 @@ static void wipeNote(char* left, size_t n, const char* name) {
     snprintf(left + used, n - used, "%s ", name);
 }
 
+// A sealed write goes through "<path>.tmp" and moves the live file to
+// "<path>.old" while installing: either can survive a crash mid-write, and a
+// wipe that left this node's own scratch on the card would not be a wipe. The
+// peer directory is swept entry by entry (peersWipeFiles), so the peer files
+// need nothing here.
+static void wipeScratch(const char* path, char* left, size_t n) {
+  static const char* const suffix[] = {".tmp", ".old"};
+  char p[80];
+  for (size_t i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++) {
+    if (snprintf(p, sizeof(p), "%s%s", path, suffix[i]) >= (int)sizeof(p))
+      continue;
+    if (sdExists(p) && !sdRemove(p))
+      wipeNote(left, n, suffix[i]);
+  }
+}
+
 // Wipe every trace of this node's identity, from the card and from RAM: the
 // key, the freshness counters, the revocation list, the peer cache with its
 // replay state, the live sessions, and each of those files.
@@ -2151,6 +2907,9 @@ static void wipeCard() {
       wipeNote(left, sizeof(left), "counter.bin");
     if (!sdRemove(REVOKED_FILE))
       wipeNote(left, sizeof(left), "revoked.bin");
+    wipeScratch(KEY_FILE, left, sizeof(left));
+    wipeScratch(STATE_FILE, left, sizeof(left));
+    wipeScratch(REVOKED_FILE, left, sizeof(left));
     // Verify by existence rather than by SD.remove()'s return value alone: the
     // claim that matters is "the files are not there any more".
     if (sdExists(KEY_FILE))
@@ -2163,6 +2922,17 @@ static void wipeCard() {
     if (peersLeft > 0)
       wipeNote(left, sizeof(left), "peers/*");
   }
+
+  // The store key goes with the identity: after a wipe there is nothing left on
+  // the card for it to open, and leaving a derived key in RAM would be the one
+  // piece of the old identity this path forgot to purge.
+  cc_store_lock(&storeKey);
+  memset(&storeKey, 0, sizeof(storeKey));
+  // If the files are really gone the card holds no container at all and the
+  // mode is plaintext. If the wipe did NOT finish, sealed files may still be
+  // there: stay sealed-but-locked, so the next 'n' asks for a passphrase
+  // instead of quietly writing the replacement identity in the clear.
+  storeMode = (card && left[0] == '\0') ? STORE_PLAIN : storeMode;
 
   // RAM: identity (and the rotation slot, which holds a whole private key
   // whenever a rotation or a mint was staged), peers, sessions.
@@ -2180,7 +2950,7 @@ static void wipeCard() {
     cc_replay_init(&peerReplayAuthed[i], peerAddrs[i], CC_REPLAY_AUTHED);
     peerReplaySavedAt[i] = 0;
   }
-  for (int i = 0; i < LINK_MAX; i++) cc_link_forget(&links[i]);
+  for (int i = 0; i < LINK_SESSION_MAX; i++) cc_link_forget(&links[i]);
   for (int i = 0; i < LINK_PENDING_MAX; i++) cc_link_forget(&linkPend[i]);
   // Plaintext scratch that could still hold a message.
   memset(chatBuf, 0, sizeof(chatBuf));
@@ -2213,9 +2983,10 @@ static void wipeCard() {
 // A one-character console on the serial port, so the identity and
 // card-lifecycle paths can actually be exercised: 'r' rotates (or, once this
 // identity has been revoked, publishes a fresh identity instead), 'x' revokes,
-// 'n' mints a new identity, 'w' wipes the card, 'i' prints the security
-// posture, and 'y' (a capital 'Y' for the wipe) confirms an 'n' or a 'w'; any
-// other key cancels, and a prompt left alone expires. See the README.
+// 'n' mints a new identity, 'w' wipes the card, 'p' sets or changes the store
+// passphrase, 'i' prints the security posture, and 'y' (a capital 'Y' for the
+// wipe) confirms an 'n' or a 'w'; any other key cancels, and a prompt left
+// alone expires. See the README.
 enum { CON_IDLE, CON_CONFIRM };
 static int conMode = CON_IDLE;
 static int conPending = 0; /* 1 = mint an identity, 2 = wipe the card */
@@ -2257,7 +3028,22 @@ static void securityInfo(const char* what) {
   logMsgf("Sys", (secFlashEnc && secSecureBoot) ? GREEN : ORANGE,
           "flash enc %s, secure boot %s", secFlashEnc ? "on" : "off",
           secSecureBoot ? "on" : "off");
-  logMsg("Sys", "protects: key.bin counter.bin revoked.bin peers/*", DARKGREY);
+  // How the sensitive files are stored, which is the part of the posture this
+  // firmware can actually control: sealed with a passphrase, sealed but not
+  // unlocked this session, plaintext, or -- reported as what it is -- an
+  // identity file nothing can read.
+  if (storeDamaged)
+    logMsg("Sys", "store UNREADABLE: key.bin is not a store or plaintext file",
+           RED);
+  else if (storeMode == STORE_SEALED)
+    logMsgf("Sys", storeKey.unlocked ? GREEN : RED, "store sealed: %s",
+            storeKey.unlocked ? "unlocked" : "LOCKED");
+  else
+    logMsg("Sys", "store PLAINTEXT: no passphrase ('p' sets one)", ORANGE);
+  logMsg("Sys", "protects: key.bin counter.bin revoked.bin peers/*.rp",
+         DARKGREY);
+  logMsg("Sys", "open: peers/*.bin (the cached announces) + the radio",
+         DARKGREY);
   if (!secFlashEnc || !secSecureBoot)
     logMsg("Sys",
             "off: a card reader IS this node; files readable + rollback-able",
@@ -2300,6 +3086,10 @@ static void handleConsole() {
       publishRevocation();
     else if (c == 'i' || c == 'I')
       securityInfo("info");
+    else if (c == 'p' || c == 'P')
+      // Set or change the store passphrase. The passphrase itself is typed on
+      // the device keyboard (masked), so this command only starts the flow.
+      setPassphrase();
     else if (c == 'n' || c == 'N') {
       // Deliberate re-identification. Confirmed, because the old identity is
       // not recoverable from this node afterwards.
@@ -3085,6 +3875,15 @@ void setup() {
     while (true) delay(1000);
   }
 
+  // Store. The passphrase is asked for HERE -- after the display and the RNG,
+  // and before anything reads the card -- because the order is forced: the
+  // console only goes live in loop(), and broadcastAnnounce() already fires at
+  // the end of setup(), so any later prompt would mean the node had read a
+  // locked store and gone public without ever asking. With no card, or with a
+  // card whose identity file is damaged, this does not prompt at all (see
+  // storeBoot()).
+  storeBoot();
+
   // Identity. Three answers, and the two that are not "loaded" must never be
   // answered with a fresh keypair: a key file that is PRESENT but does not load
   // is damage, and NO CARD AT ALL is not an empty card (minting on a cardless
@@ -3117,6 +3916,13 @@ void setup() {
       if (cs == FILE_ST_NOCARD) {
         logMsg("Sys", "no SD card: refusing to mint an identity", RED);
         logMsg("Sys", "insert the card, or 'n' to run without one", RED);
+      } else if (storeLocked()) {
+        // Not readable because the store is locked, which is not the same claim
+        // as a damaged file: the boot above already said the passphrase was not
+        // accepted.
+        logMsg("Sys", "key.bin not read: store LOCKED, refusing to run", RED);
+        logMsg("Sys", "no identity: 'w' wipes, 'n' mints one, deliberately",
+                RED);
       } else {
         logMsg("Sys", kr == FILE_ST_INVALID ?
                           "key.bin INVALID: refusing to run" :

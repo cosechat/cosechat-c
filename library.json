@@ -15,16 +15,15 @@
     "srcDir": "src",
     "includeDir": "include",
     "flags": [
-      "-DHAVE_DILITHIUM",
-      "-DWOLFSSL_WC_DILITHIUM",
-      "-DWOLFSSL_HAVE_MLKEM",
-      "-DWOLFSSL_WC_MLKEM",
-      "-DHAVE_AESGCM",
-      "-DHAVE_HKDF",
-      "-DWOLFSSL_SHA256",
-      "-DWOLFSSL_SHA3",
-      "-DHAVE_SHAKE256",
-      "-DWOLFSSL_KEY_GEN"
+      "-DHAVE_DILITHIUM=",
+      "-DWOLFSSL_WC_DILITHIUM=",
+      "-DWOLFSSL_HAVE_MLKEM=",
+      "-DWOLFSSL_WC_MLKEM=",
+      "-DHAVE_AESGCM=",
+      "-DHAVE_HKDF=",
+      "-DWOLFSSL_SHA256=",
+      "-DWOLFSSL_SHA3=",
+      "-DWOLFSSL_KEY_GEN="
     ]
   },
   "dependencies": {

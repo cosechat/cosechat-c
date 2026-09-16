@@ -25,11 +25,15 @@ run one road at a time.
 Two nodes only hear each other on the same medium: both on channel 1 for
 `dot11`, and both within BLE advertising range for `ble`. Neither road
 acknowledges anything, so the big packets are the lossy part. An `announce` is
-~6.5 KB (6470 B measured, ~27 LoRa fragments and ~27 BLE advertisements) and
-the opportunistic `chat` is ~4.5 KB (~19 fragments, it carries a per-message
-ML-DSA signature), but a **link** (session) pays that once: `link_req` is ~5
-fragments, `link_proof` ~14, and then every message is a single AEAD record —
-one fragment. A presence is one fragment either way.
+~6.5 KB (6472 B measured, ~27 LoRa fragments and ~27 BLE advertisements) and
+the opportunistic `chat` is ~4.5 KB (4515 B, ~19 fragments, it carries a
+per-message ML-DSA signature), but a **link** (session) pays that once:
+`link_req` is ~5 fragments (1110 B), `link_proof` ~14 (3331 B), and then every
+message is a single AEAD record — 45 B, one fragment. A presence is one
+fragment either way (34 B), and a `key_req` is one (27 B). Those byte counts are
+the `build/chat` tool's own measurement and they move by a byte or two between
+runs, because the mined PoW nonce is CBOR-encoded and its width varies; the
+fragment counts do not move.
 
 ## Controls
 
@@ -40,11 +44,13 @@ one fragment. A presence is one fragment either way.
 | Enter | send the message to the selected peer |
 | Del | backspace |
 
-The serial console takes five commands: `r` (rotate identity), `x` (revoke it),
-`n` (mint a new identity — the recovery path for a damaged key file or a
-cardless run, see "What the card *is*"), `w` (wipe the card) and `i` (print the
-security posture); `n` takes `y`, `w` takes a capital `Y`, and either prompt is
-cancelled by any other key or by a five-second timeout.
+The serial console takes six commands: `r` (rotate identity), `x` (revoke it),
+`p` (set or change the store passphrase — on a plaintext card this is the
+migration, see "The passphrase store"), `n` (mint a new identity — the recovery
+path for a damaged key file or a cardless run, see "What the card *is*"), `w`
+(wipe the card) and `i` (print the security posture); `n` takes `y`, `w` takes a
+capital `Y`, and either prompt is cancelled by any other key or by a five-second
+timeout.
 
 The status bar shows the first 4 bytes of this node's address, or `no id` while
 the node is inert (no identity).
@@ -78,6 +84,12 @@ verify budget.
   heartbeat every 60 s. A key file that is *present but invalid* is not
   regenerated: the node goes inert instead and waits for `n`, so a damaged card
   can never silently re-identify it (see "What the card *is*").
+- **The card can be sealed with a passphrase.** `key.bin`, `counter.bin`,
+  `revoked.bin` and each `peers/<hex>.rp` are then stored as authenticated
+  containers instead of plaintext (see "The passphrase store"); the peer
+  announce cache stays readable on purpose. A sealed card asks for the
+  passphrase at boot, before anything reads the card, and three failures leave
+  it locked and inert rather than guessing.
 - Every packet carries the wire version; a packet from another revision is
   dropped, with a one-off `Sys` note, before any PoW or crypto work.
 - **Announces have a lifecycle.** Each carries a signed monotonic `seq` and a
@@ -108,10 +120,12 @@ verify budget.
   no receive path opens SD: an SD read holds the SPI mutex the radio also needs,
   and a forged packet must not be able to trigger one. SD stays the cold store,
   read at boot and written when an announce changes.
-- All library calls go through one static `cc_work_t` (~34 KB of scratch,
-  heap-free, never on the stack). One context is enough because the library is
-  only called from `setup()`/`loop()`; the road tasks touch only the framing
-  helpers in `cosechat_road.c` and never enter this library.
+- All library calls go through one static `cc_work_t` (34752 B of scratch,
+  statically reserved, never on the stack — wolfCrypt's own working buffers
+  under `WOLFSSL_SMALL_STACK` are a separate story, see the RAM budget). One
+  context is enough because the library is only called from `setup()`/`loop()`;
+  the road tasks touch only the framing helpers in `cosechat_road.c` and never
+  enter this library.
 - **Admission pricing (v9).** An announce carries a three-byte declaration of
   what its owner asks senders to mine for the directed types (`chat`,
   `link_req`, `key_req`); this node publishes its own policy with
@@ -145,9 +159,9 @@ Sending prefers an open link (one fragment, no per-message signature); when none
 is open the node starts a handshake *and* sends the opportunistic signed chat,
 so the message still gets through while the session is set up. A link is kept
 warm with a keepalive after 60 s of quiet and is forgotten after 180 s idle;
-`LINK_MAX` is 4 sessions, which covers the one peer being talked to plus a
-handshake or two in flight, at 168 bytes each. Links live in RAM only: a reboot
-forgets them and the next message re-handshakes.
+`LINK_SESSION_MAX` is 4 sessions, which covers the one peer being talked to plus
+a handshake or two in flight, at 168 bytes each. Links live in RAM only: a
+reboot forgets them and the next message re-handshakes.
 
 **A responder-side handshake does not get a session.** Answering a `link_req`
 puts the half-open session in a two-entry pending table with a 12 s TTL instead
@@ -179,15 +193,36 @@ budgeted (`LINK_ACCEPT_BURST` per `LINK_ACCEPT_WINDOW_MS`) *before* the
 decapsulation and the proof signature, so a request flood cannot turn the node
 into a signature oracle.
 
-RAM budget: the big static objects are the `cc_work_t` scratch (~34 KB), the
-peer key cache (16 × (1952 + 1184) ≈ 50 KB), the rotation key (~13 KB, live
-only while a rotation is published, but statically reserved) and the wire
-scratch buffers; the envs build at 66–75% of the ESP32-S3's 320 KB DRAM, with
-`wifi` the tightest at ~74.8% (244984 B; lora 219088, lora-relay 227872, ble
-229936, dot11 242988). Additions from the security and card work are small and
-named: the revocation-load scratch (224 B), the chat verify budget (72 B), the
-envelope (a CRC with no table, locals only), the seed-form key scratch and the
-console state. Nothing allocates.
+RAM budget: the big static objects, measured with `nm` on a built `wifi` ELF,
+are the `cc_work_t` scratch (34752 B), the peer key cache (`peerSignPub` 31232 B
++ `peerKemPub` 18944 B ≈ 50 KB), the **store buffers** (`storeCont` 8453 B +
+`storePlain` 8394 B ≈ 16.5 KB — together the third-largest block after the two
+above, and each one larger than every "small and named" item below), the two key
+slots (`myKey` and `newKey`, 13072 B each; the rotation slot is statically
+reserved even though it is only live while a rotation is published), the road
+state (`roadImpl`, 15984 B on `wifi`), and the wire scratch (`ctlBuf` 10380 B,
+`rxPkt` 7936 B, `annBuf` 7023 B, `chatBuf` 5421 B). The envs build at 66–75% of
+the ESP32-S3's 320 KB DRAM, with `wifi` the tightest at ~74.4% (243704 B; lora
+217800, lora-relay 226576, ble 228648, dot11 241700). The store came out
+**1.3 KB smaller** per env than the buffers it replaced — it uses two buffers
+where `keyLoad`/`keySave` used three, and the save path reuses the read buffer —
+so RAM went down, not up, with the passphrase feature; `include/user_settings.h`
+records the same measurement (217800 B for `lora`, 1296 B less than before the
+store). The other additions from the security and card work are small and named:
+the revocation-load scratch (224 B), the chat verify budget (72 B), the envelope
+(a CRC with no table, locals only), and the console state.
+
+Nothing in the sketch allocates, and no part of the app sizes itself at runtime:
+every app buffer is a compile-time constant, and every table walk is bounded by
+its array size. wolfCrypt is a different matter and it is worth being exact
+about it: this build sets `WOLFSSL_SMALL_STACK` — the define, in
+`examples/cardputer/include/user_settings.h`, next to `SINGLE_THREADED` and
+below the `NO_PWDBASED` note (grep the name rather than trusting a line number:
+that file's comment grew and moved it once already) — under which wolfCrypt
+puts its working buffers on the heap through `XMALLOC` instead of on the stack,
+so the heap is used under this build even though this sketch never calls it.
+The passphrase store's PBKDF2 and the ML-KEM/ML-DSA paths are wolfCrypt's
+allocation, not this sketch's.
 
 ## Identity: rotation and revocation
 
@@ -294,8 +329,8 @@ those tick units. Only the RAM-shaped knobs are cut: `CC_RELAY_PATHS` 16,
 `CC_RELAY_DUP` 16 and `CC_RELAY_BUDGETS` 8, which makes `cc_relay_t` 1380 B
 instead of the default 4196 B (measured with `sizeof` under the env's defines:
 16 paths × 48 B, 16 duplicate slots × 20 B, 8 budget slots × 24 B, the window,
-the two pool counters and 88 B of counters), plus a 7 KB re-broadcast buffer
-(`CC_ANN_BUF_SZ + 1` = 7024 B) and the 8-entry pin table.
+the two pool counters and 88 B of counters), plus a 6.9 KB re-broadcast buffer
+(`annBuf`, `CC_ANN_BUF_SZ` = 7023 B) and the 8-entry pin table.
 
 The origin check depends on the road, and where the road can attribute a sender
 the app pins it. `cc_road_t` reports the transmitting source it heard a packet
@@ -350,13 +385,18 @@ envelope               "CCFS" <version 1> <crc32 LE of the payload>
 /cc/peers/<hex>.rp     envelope + <version><unsigned cc_replay_t><authed cc_replay_t>
 ```
 
+Four of these five kinds are additionally wrapped in a passphrase container
+(`CCSP`) when the store is sealed — `key.bin`, `counter.bin`, `revoked.bin` and
+`peers/<hex>.rp` — while `peers/<hex>.bin` never is (see "The passphrase
+store", which has the container layout and the sealed sizes).
+
 `key.bin`'s payload starts with a form byte, and the identity is stored as
 **seeds**, not as expanded private keys:
 
 | Form | Payload | Size |
 |------|---------|------|
 | `1` seed (what this build writes) | `form` 1 + `sign_seed` 64 + `kem_seed` 64 + `sign_pub` 1952 | 2081 B (2090 B file) |
-| `2` expanded (read for compatibility, written only when there is no seed) | `form` 1 + `sign_priv` 4032 + `sign_pub` 1952 + `kem_priv` 2400 | 8385 B (8394 B file) |
+| `2` expanded (read for compatibility, written only when there is no seed) | `form` 2 + `sign_priv` 4032 + `sign_pub` 1952 + `kem_priv` 2400 | 8385 B (8394 B file) |
 
 (Computed from the header's own size macros: `CC_SIGN_SEED_SZ` 64,
 `CC_KEM_SEED_SZ` 64, `CC_SIGN_PUBKEY_SZ` 1952, `CC_SIGN_PRIVKEY_SZ` 4032,
@@ -415,33 +455,178 @@ reboot may repeat a counter or a `seq`: peers reject that as a replay (or as a
 stale announce) until a card carries the state file; the same applies to the
 replay windows, which a peer could replay once more after our reboot.
 
+### The passphrase store
+
+`p` seals the card with a passphrase. Four of the five file kinds are then
+written as containers instead of plaintext — `key.bin`, `counter.bin`,
+`revoked.bin` and each `peers/<hex>.rp` — while **`peers/<hex>.bin` stays
+plaintext on purpose**: its contents are the peer announces the mesh broadcasts
+anyway (public keys, names, prices), and leaving it readable is what lets the
+peer list and the display still work while the store is locked. The store is the
+sketch's own policy: the radio, the wire and the library know nothing about it.
+
+One container shape serves every sealed kind (format version 1); the module's
+own table is the contract:
+
+```
+off  size  field              notes
+---  ----  -----------------  -------------------------------------------
+0    4     magic = "CCSP"     identifies the container, not the file kind
+4    1     format version = 1
+5    1     kdf id = 1         PBKDF2-HMAC-SHA256
+6    4     kdf iterations     work factor, big-endian uint32
+10   16    salt               RNG, per store (not per file: see below)
+26   1     aead id = 1        AES-256-GCM
+27   12    nonce              RNG, fresh for every seal, never reused
+39   4     plaintext length   big-endian uint32, authenticated
+43   N     ciphertext         N = plaintext length
+43+N 16    tag                GCM tag
+```
+
+Header 43 + tag 16 means **N bytes of plaintext become exactly N + 59 bytes on
+disk** — a compile-time constant, so every buffer is static and the exact-length
+rule is part of the format (a truncated or extended container is rejected before
+any crypto runs). That makes the sealed sizes:
+
+| File | Plaintext | Sealed |
+|------|-----------|--------|
+| `key.bin`, seed form | 2090 | 2149 |
+| `key.bin`, expanded form | 8394 | 8453 |
+| `counter.bin` | 20 | 79 |
+| `revoked.bin` | 234 | 293 |
+| `peers/<hex>.rp` | 74 | 133 |
+| `peers/<hex>.bin` | 3530 | not sealed |
+
+How the key is derived: **PBKDF2-HMAC-SHA256**, 16-byte RNG salt, work factor
+carried in the container header (default 100000 iterations; the accepted range
+10000–2000000 is enforced on read too, so a forged cheap container is damage and
+a very expensive one cannot become a denial of service). One salt per card and
+one KDF run per unlock, not one per file — the freshness counter is rewritten
+every few seconds, so per-file derivation would put a PBKDF2 in the write path;
+each container is sealed under a per-file key derived with HKDF-SHA256 from the
+master key, the salt and the context string, and the plaintext is sealed with
+**AES-256-GCM** under a fresh 12-byte nonce. The context is the file's **path**,
+not the node's address: an address changes on a rotation, and a container sealed
+under the old address would then be unreadable by the node that owns it.
+
+The header, the context and the ciphertext are all authenticated, so a container
+cannot be moved to another file name, given a different work factor, or have its
+length field edited. The two failure codes the operator can see are worth
+knowing:
+
+- `CC_STORE_E_AUTH` — the tag did not verify. **Wrong passphrase and tampering
+  are indistinguishable by construction**, and the node does not pretend
+  otherwise; "wrong passphrase or damaged file" is the truth.
+- `CC_STORE_E_DAMAGE` — the public structure is wrong (not a container, a header
+  that will not parse, a length that is not exactly header + plaintext + tag, an
+  unknown algorithm id). Anyone holding the bytes can reach the same verdict, so
+  saying it out loud reveals nothing.
+
+**No recovery, by design.** The key comes from the passphrase and the salt and
+from nothing else: there is no recovery phrase, no escrow, no hint and no
+second path, and nothing here may grow one. Forget the passphrase and the sealed
+files are gone — the only way back is `w` (wipe the card) and then `n` (mint a
+new identity).
+
+What it buys, and what it does not:
+
+- It protects the card **at rest, with the device off and the card out**. That
+  is the posture the SD-layout section calls "a card reader IS this node": with
+  a passphrase set, the key and the state files are not readable without it.
+- It does **not** protect a device that is running and unlocked, and it does not
+  cover `peers/<hex>.bin` (see above) or the radio.
+- It does **not** make the card's FAT forget bytes. Replacing a sealed file
+  moves the live file aside as `<path>.old`, and that name is what a migration
+  or a re-key briefly leaves behind; FAT unlinks the directory entry, it does
+  not wipe the blocks, so a determined reader with the raw card can still
+  recover a file that was replaced — sealed or plaintext. The wipe is the same
+  story: it removes files, it does not shred the medium.
+- The KDF cost is **unmeasured on this part**. The module only says PBKDF2 is
+  not cheap ("HKDF is a few microseconds; PBKDF2 is not"), and the firmware
+  prints `deriving key (PBKDF2, slow on this part)...` before every derivation
+  precisely so the operator knows why the device pauses; no board was available
+  to time it, so no number is quoted here.
+
+The boot flow, in the order it happens:
+
+- **A fresh card**: the passphrase is asked for **before the first private key
+  exists**, so a key is never written in the clear even for a moment. An empty
+  answer is a legitimate answer — it means "run this card in the clear" — and it
+  is warned about out loud (`store PLAINTEXT: no passphrase set`, and that
+  `key.bin` is readable by anyone with the card) rather than being taken
+  silently.
+- **A sealed card**: it prints `store SEALED: key.bin needs the passphrase` and
+  asks, with three attempts. A derivation that does not open the identity file
+  leaves the store **locked and the node inert** — never minting, because
+  re-identifying the node over a typo would be the worst possible answer to one.
+- **A legacy plaintext card**: recognised the way it can be recognised, by the
+  envelope every plaintext file carries (`"CCFS"` + version), so it boots
+  exactly as it always did, with `store PLAINTEXT: 'p' sets a passphrase` on the
+  log. Migration is the operator's `p`, and it is never automatic.
+- **A `key.bin` that is neither**: not a container and not one of our plaintext
+  envelopes — truncated, half-written, or a file from something else — is
+  reported as damaged (`key.bin UNREADABLE: not a store, not a plaintext file`)
+  and the node refuses to run: no prompt, no passphrase offered, no migration
+  prompt, and `key.bin INVALID: refusing to run` from the identity path, which
+  is the same fail-closed answer a damaged key file has always had. Calling it
+  "plaintext" here would misstate the node's posture, so it does not; only the
+  wording knows the difference, and the mode stays plaintext solely so that the
+  identity path reaches its normal INVALID answer.
+- **A container from a newer firmware**: `store: newer format than this
+  firmware`; it stays sealed and locked, so the node refuses to run rather than
+  guessing at a format it does not know.
+- **A missing `key.bin` on a card whose other files are sealed**: no prompt (a
+  missing key file is damage, not a fresh start) but the store is remembered as
+  sealed, so a later `n` asks for a passphrase instead of quietly writing the
+  replacement identity in the clear.
+
+The `p` command sets or changes the passphrase. On a plaintext card that is the
+migration: it seals every file. On a sealed card it first asks for the **current
+passphrase** and opens `key.bin` with it, because an unlocked store only means
+the passphrase was typed at boot and the operator may have walked away since;
+then it asks for the new passphrase **twice**, refuses an empty one (that is not
+a way to remove a store that exists — `w` erases the card, and dropping the
+passphrase while keeping the identity would be a silently weaker card), and
+seals every file again — windows, revocation list, counter and the identity
+**last**, because `key.bin` is the file that decides the mode at the next boot.
+If any of that fails it puts the previous key and mode back and rewrites every
+file, so a failed change leaves a working card and not half of one; if even the
+rollback cannot complete it says `ROLLBACK INCOMPLETE: 'w' then 'n' makes a new
+identity`. A passphrase change costs one KDF run plus one HKDF per file.
+
 ### What the card *is*
 
-Everything persisted is in the clear, and a reader of the card can be more than
-a reader:
+What a reader of the card gets depends on whether the store is sealed: with no
+passphrase set, all of it is in the clear, and a reader of the card can be more
+than a reader.
 
-| File | In the clear | What a card reader gets |
-|------|--------------|--------------------------|
-| `/cc/key.bin` | yes | the node's private identity — it holds the two 64-byte seeds the keys are rebuilt from, and it can impersonate this node to every peer |
-| `/cc/counter.bin` | yes (not secret) | the values peers use to decide what is fresh, plus the retired flag |
-| `/cc/revoked.bin` | yes | which identities this node has retired |
-| `/cc/peers/<hex>.bin` | public data anyway | every cached peer announce (public keys, name, price) |
-| `/cc/peers/<hex>.rp` | yes | the replay windows, i.e. how far each peer has counted |
+| File | Sealed? | Plaintext | With the passphrase |
+|------|---------|-----------|---------------------|
+| `/cc/key.bin` | yes | the node's private identity — the two 64-byte seeds the keys are rebuilt from; it can impersonate this node to every peer | a container: unreadable without the passphrase |
+| `/cc/counter.bin` | yes | the values peers use to decide what is fresh, plus the retired flag | a container |
+| `/cc/revoked.bin` | yes | which identities this node has retired | a container |
+| `/cc/peers/<hex>.rp` | yes | the replay windows, i.e. how far each peer has counted | a container |
+| `/cc/peers/<hex>.bin` | **no, on purpose** | every cached peer announce (public keys, name, price) | still readable — the mesh broadcasts this anyway, and the peer list has to work while the store is locked |
 
-So: **the card is the identity**. Physical possession is the security boundary;
-the files are crash-proof, not tamper-proof.
+So: **the card is the identity**. With no passphrase, physical possession is the
+whole security boundary and the files are crash-proof but not tamper-proof; with
+one, possession gets you the ciphertext for four of the five kinds and the
+passphrase is the boundary for those. Either way the card is the identity, which
+is why the wipe exists.
 
-Two consequences, stated because they are real:
+Consequences, stated because they are real:
 
 - **Rollback is possible and is not detected.** Copying an older-but-valid file
-  back onto the card passes the envelope. The effects: reused freshness
-  counters and announce sequences (peers drop this node's traffic as a replay or
-  a stale announce until it passes their high-water marks — the counter resumes
-  `CC_REPLAY_WINDOW` past the saved value, which bounds it), an older `.rp` (one
-  captured packet can replay once), and an older `revoked.bin` (a retired
-  identity is trusted again on this node). The durable fixes are hardware —
-  flash encryption and secure boot — or an operator passphrase that encrypts the
-  key file; **the passphrase is not implemented** here.
+  back onto the card passes both the envelope and (if it is sealed) the
+  container's own checks: it is a valid container under the same key. The
+  effects: reused freshness counters and announce sequences (peers drop this
+  node's traffic as a replay or a stale announce until it passes their
+  high-water marks — the counter resumes `CC_REPLAY_WINDOW` past the saved
+  value, which bounds it), an older `.rp` (one captured packet can replay once),
+  and an older `revoked.bin` (a retired identity is trusted again on this node).
+  The passphrase does not help here — it keeps a reader out, it does not make an
+  old file detectable — and neither does the envelope. The durable fix is
+  hardware: flash encryption and secure boot (see "Seeing the posture").
 - **Damage and a missing card do not re-identify the node.** A `/cc/key.bin`
   that is present but invalid (wrong size, unreadable, unknown form, failing its
   CRC, or a seed that does not produce the stored `sign_pub`), and equally a
@@ -464,6 +649,18 @@ The fail-safe chosen per file, so nothing is silent about it:
 | `key.bin` | fail closed: no identity, inert, `n` to recover (never auto-mint) | same: no identity, inert, `n` to run cardless |
 | everything else | the node is inert, so nothing is read anyway | inert |
 
+A sealed file that **will not open** is *invalid*, never *absent* — absence is
+what decides whether this node mints, so a container that fails to authenticate
+(freshly damaged, or sealed under another key) can never be read as "first boot".
+A **locked** store is its own case: with no key in RAM the sealed kinds are
+never decrypted and never judged on their bytes. `counter.bin`, `revoked.bin`
+and `peers/*.rp` are skipped before any read and take their own fail-safe
+silently (RNG-seeded counter, empty list, fresh windows), while `key.bin` comes
+back **invalid from the lock itself**, not from its contents — which is what
+makes the node inert. The boot block has already said why in the operator's
+words (`store LOCKED: key.bin was not read`) before the identity path says
+anything, and `i` reports `store sealed: LOCKED` for as long as it lasts.
+
 Once the identity loads, the other files are read and each takes its own
 fail-safe:
 
@@ -473,6 +670,7 @@ fail-safe:
 | `revoked.bin` | treat as absent (empty list) **and log it** — retired identities are trusted again until they are revoked once more; the durable fix is to rotate away from a leaked key |
 | `peers/<hex>.bin` | skip the file **and log a count**; an unknown payload version is treated the same way — the peer simply re-announces |
 | `peers/<hex>.rp` | start fresh windows for that peer **and log it** — a captured packet may replay once |
+| a sealed kind that will not open (wrong passphrase not yet given, or a container from another key) | never *absent*: the loader treats it as invalid, and `key.bin` failing closed is what makes the whole node inert until the passphrase is given or `w`/`n` is chosen |
 
 ### Seeing the posture (and turning it on)
 
@@ -483,13 +681,34 @@ difference is the first word):
 ```
 Sys: boot: id 1a2b3c4d, sd mounted
 Sys: flash enc off, secure boot off
-Sys: protects: key.bin counter.bin revoked.bin peers/*
+Sys: store PLAINTEXT: no passphrase ('p' sets one)
+Sys: protects: key.bin counter.bin revoked.bin peers/*.rp
+Sys: open: peers/*.bin (the cached announces) + the radio
 Sys: off: a card reader IS this node; files readable + rollback-able
 ```
+
+The third line is the part of the posture this firmware actually controls, and
+it has four states: `store PLAINTEXT: no passphrase ('p' sets one)` (amber) on a
+card with no passphrase, `store sealed: unlocked` (green) once the passphrase
+has been given this session, `store sealed: LOCKED` (red) when the store is
+sealed and no key is in RAM — the state a wiped card, an unknown passphrase or a
+skipped prompt leaves behind — and `store UNREADABLE: key.bin is not a store or
+plaintext file` (red) when the identity file is neither, which is the one state
+where the node is inert *and* the posture is unknown rather than merely weak.
+`protects:` is the list of sealed kinds and `open:` the one kind that stays
+plaintext plus the radio (see "The passphrase store").
 
 `flash enc on, secure boot on` is printed in green and the last line disappears;
 anything else is amber plus that red line. `sd ABSENT` replaces `mounted` when
 there is no card, and `id no id` when the node is inert.
+
+The last red line is about the platform, not about the store, and it still
+prints when the store is sealed: read it as "`peers/*.bin` and the radio are
+readable, and everything this session has unlocked is unlocked because the
+passphrase is in RAM". At rest, with the card out, the four sealed kinds are
+not readable without the passphrase — which is exactly what the store line
+above it says. The two lines answer different questions: the passphrase is this
+firmware's protection, the fuses are the platform's.
 
 Where the answers come from: `esp_flash_encryption_enabled()` (bundled ESP-IDF
 `tools/sdk/esp32s3/include/bootloader_support/include/esp_flash_encrypt.h`,
@@ -507,7 +726,9 @@ prose.
 
 Enabling them, for this board (`esp32-s3-devkitc-1`) with this framework
 (PlatformIO `platform = espressif32@6.7.0`, `framework = arduino`,
-arduino-esp32 2.0.16 / ESP-IDF 4.4) — what I checked, and what it means:
+arduino-esp32 2.0.17 / ESP-IDF 4.4.7 — read from the installed tree's
+`cores/esp32/esp_arduino_version.h` and `tools/sdk/esp32s3/include/esp_common/
+include/esp_idf_version.h`) — what I checked, and what it means:
 
 - They are **bootloader and fuse** features, not application flags. In IDF terms
   the knobs are `CONFIG_SECURE_BOOT` and `CONFIG_SECURE_FLASH_ENC_ENABLED`.
@@ -522,18 +743,21 @@ arduino-esp32 2.0.16 / ESP-IDF 4.4) — what I checked, and what it means:
   not build is a bootloader you cannot configure.
 - The path that does exist in this platform is the **`espidf` framework**, whose
   builder takes `board_build.esp-idf.sdkconfig_path` (defaulting to
-  `sdkconfig.<env>`) and passes it to the build as `-DSDKCONFIG=…`
-  (`builder/frameworks/espidf.py:111-113` and `:862`). That is where the two
-  `CONFIG_` options would be set, together with the partitions and the
-  secure-boot key; arduino-esp32 as an IDF component is the equivalent route on
-  newer arduino-esp32 releases.
-- What each buys: flash encryption makes the app image and the files it writes
-  unreadable off-device (so `/cc/key.bin` and the state files stop being
-  readable, which is the "a card reader IS this node" line going away for the
-  flash); secure boot makes the ROM verify the bootloader and each image, so a
-  modified image will not run. Neither covers the SD card itself: the card is
-  removable and stays in the clear unless the app encrypts what it writes (it
-  does not).
+  `sdkconfig.<env>`) and passes it to the build as `-DSDKCONFIG=…`. In the
+  pinned 6.7.0 tree those are `builder/frameworks/espidf.py`'s
+  `board.get("build.esp-idf.sdkconfig_path", … "sdkconfig.%s" …)` default and
+  the `"-DSDKCONFIG=" + SDKCONFIG_PATH` entry in the CMake argument list (lines
+  111-113 and 862 *there* — the numbers move between platform releases, so match
+  the text, and note those paths are inside the platform package, not this
+  repo). That is where the two `CONFIG_` options would be set, together with the
+  partitions and the secure-boot key; arduino-esp32 as an IDF component is the
+  equivalent route on newer arduino-esp32 releases.
+- What each buys: flash encryption makes the app image, and anything else in
+  flash, unreadable off-device; secure boot makes the ROM verify the bootloader
+  and each image, so a modified image will not run. **Neither touches the SD
+  card** — it is a separate, removable medium — and what covers the card is the
+  passphrase store, at rest, for four of the five file kinds (see "The
+  passphrase store").
 - What each costs: **burning the efuses is irreversible**, enabling encryption
   means the flash must be re-flashed/encrypted from then on, and **a lost or
   wrong key means the device is bricked** — the chip will boot nothing. These
@@ -548,23 +772,33 @@ route above.
 
 `w` then **`Y` (capital)** is the "retire the device / hand over the card" path
 and it **verifies itself**: it removes `key.bin`, `counter.bin`, `revoked.bin`
-and every file in `/cc/peers/`, then re-checks by existence that they are gone.
+and every file in `/cc/peers/` — including any `.tmp`/`.old` left by an
+interrupted sealed write — then re-checks by existence that they are gone.
 A removal the card refuses — a write-protected card, a failed mount, a stuck
 bus — is reported as `WIPE INCOMPLETE: still present: …` in red rather than
 claimed as done, and the operator is told to erase the card by hand. The RAM
 half cannot fail and happens either way: the identity, the peer cache with its
 replay windows, the revocation list, the live sessions, the rotation slot (a
-whole staged private key) and the plaintext scratch buffers are wiped, and the
-counters are reseeded from the hardware RNG — so even a card that kept its files
-leaves a node that is inert and purged. It logs exactly what it destroyed, and
-the node stays inert (`no id`) until `n`.
+whole staged private key), the store's derived key and the plaintext scratch
+buffers are wiped, and the counters are reseeded from the hardware RNG — so even
+a card that kept its files leaves a node that is inert and purged. It logs
+exactly what it destroyed, and the node stays inert (`no id`) until `n`.
+
+The store is handled with the same care: the derived key is zeroized, and if the
+files really are gone the card is back to `STORE_PLAINTEXT`, while an
+**incomplete** wipe stays sealed-but-locked — sealed files may still be out
+there, so a later `n` asks for a passphrase rather than quietly writing the
+replacement identity in the clear. The wipe removes files; it does not shred the
+medium (see "The passphrase store").
 
 `n` then `y` mints a new identity. It is the recovery path for a damaged or
 missing key file, the way to run without a card, and the deliberate path for
-"the old key is burned, give me a new one with no continuity". Both prompts are
-cancelled by any other key **or by a five-second timeout**, so an abandoned `w`
-cannot be confirmed by a stray keypress later; only the wipe needs the capital
-letter, because only it is unrecoverable.
+"the old key is burned, give me a new one with no continuity". With a sealed but
+**locked** store (unknown passphrase, or a card just wiped) it asks for a
+passphrase decision first, so a replacement private key is never quietly written
+in the clear. Both prompts are cancelled by any other key **or by a five-second
+timeout**, so an abandoned `w` cannot be confirmed by a stray keypress later;
+only the wipe needs the capital letter, because only it is unrecoverable.
 
 Neither `n` nor `w` can be undone from the node. A wipe followed by a reboot
 also mints on the next boot, because a card with nothing on it is a first boot —
@@ -612,7 +846,7 @@ supplies only its medium: an `emit` callback (`cc_road_emit_fn`) that
 and a non-blocking `recv()` that copies a completed packet out with
 `cc_road_pkt_get()`. The RX path feeds fragments to a `cc_road_frag_t` through
 `cc_road_rx_frag()`. The fragmentation and reassembly loop is shared rather
-than copied per road, and nothing here allocates.
+than copied per road, and nothing in the road layer allocates.
 
 Every fragment is a 4-byte header (`magic, msg_id, frag_idx, frag_total`) plus
 payload, and both ends must agree on the payload size because it is not

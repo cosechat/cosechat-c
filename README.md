@@ -489,14 +489,24 @@ lib_deps =
   https://github.com/cosechat/cosechat-c
 ```
 
-Required wolfSSL build flags (kept in sync with `library.json`):
+Required wolfSSL build flags — the nine `library.json` lists, in that file's
+exact `-DNAME=` form (`jq -r '.build.flags[]' library.json` prints them, and
+this list is kept in sync with that one by diffing the two):
 
 ```
--DHAVE_DILITHIUM -DWOLFSSL_WC_DILITHIUM
--DWOLFSSL_HAVE_MLKEM -DWOLFSSL_WC_MLKEM
--DHAVE_AESGCM -DHAVE_HKDF -DWOLFSSL_SHA256 -DWOLFSSL_SHA3
--DHAVE_SHAKE256 -DWOLFSSL_KEY_GEN
+-DHAVE_DILITHIUM= -DWOLFSSL_WC_DILITHIUM=
+-DWOLFSSL_HAVE_MLKEM= -DWOLFSSL_WC_MLKEM=
+-DHAVE_AESGCM= -DHAVE_HKDF= -DWOLFSSL_SHA256= -DWOLFSSL_SHA3=
+-DWOLFSSL_KEY_GEN=
 ```
+
+The empty replacement is deliberate: a bare `-DNAME` means `NAME 1`, which
+differs from the bare `#define NAME` that wolfSSL's own `user_settings.h` and
+its generated `options.h` use, so a translation unit that sees both warns on
+every redefinition. A consumer that would rather pass no flags at all can define
+`WOLFSSL_USER_SETTINGS` and let a `user_settings.h` supply the same features,
+which is what the reference firmware does
+([`examples/cardputer/include/user_settings.h`](examples/cardputer/include/user_settings.h)).
 
 Targets: any platform with wolfSSL + wolfCOSE (desktop, WASI, ESP32, other
 MCUs). The library has no framework or platform manifest restriction; the
@@ -662,13 +672,25 @@ The reference firmware (`examples/cardputer`, ESP32-S3, 327680 B RAM and
 
 ## Storage posture
 
-A reference node keeps its whole durable state in the clear on a removable SD
-card under `/cc/` — see [`examples/cardputer`](examples/cardputer) for the
-firmware's own account of the files, the fail-safes and the console commands:
+The library is **storage-agnostic**: nothing in `include/cosechat.h`,
+`src/cosechat.c`, the road layer or the relay reads or writes a file, and the
+protocol carries no storage policy at all — every state object it defines
+(`cc_key_t`, `cc_replay_t`, `cc_link_t`, `cc_revoked_t`, `cc_relay_t`) is the
+caller's to keep, and keeping it is the consumer's problem. Everything below is
+therefore the *reference firmware's* policy, in
+[`examples/cardputer`](examples/cardputer), which is the worked example of a
+consumer's storage layer:
+
+A reference node keeps its durable state on a removable SD card under `/cc/` —
+in the clear unless the operator sets the store passphrase, in which case the
+sensitive files are sealed containers. See the firmware's own account for the
+layout, the fail-safes and the console commands:
 
 - **`/cc/key.bin` is the identity**, and it is stored as seeds: a form byte,
   the two 64-byte seeds and `sign_pub` (the form the firmware writes), so
-  reading the card makes you that node to every peer.
+  reading a plaintext card makes you that node to every peer. With the
+  passphrase store set, the file on the card is a container instead, and the
+  passphrase, not the card, is what makes you the node.
 - **Rollback is possible and is not detected.** `counter.bin`,
   `peers/<hex>.rp` and `revoked.bin` are trusted as read, so a *valid older*
   copy passes the envelope: a reused counter or `seq` makes peers drop this
@@ -728,10 +750,10 @@ form): that is not corruption, so the node saves the expanded form, logs it and
 carries on, and the next identity it generates is compact again.
 
 **The honest limits.** Nothing here is enabled by default: flash encryption and
-secure boot are the platform's, both off unless someone turns them on, and no
-code path in this node assumes either. A passphrase over the key file is not
-implemented at all. So by default physical possession of the card is the
-security boundary, and the files are crash-proof, not tamper-proof.
+secure boot are the platform's, both off unless someone turns them on, no code
+path in this node assumes either, and the passphrase store is the firmware's and
+off until someone sets one. So on a plain card physical possession of the card
+is the security boundary, and the files are crash-proof, not tamper-proof.
 
 ### Hardening a real deployment
 
@@ -746,19 +768,28 @@ concrete and each one buys something specific:
 - **Keys in NVS instead of the card** — only meaningful together with flash
   encryption (an encrypted NVS partition), and it gives up the "the card is the
   identity" property on purpose: copying the card no longer copies the identity.
-- **A passphrase over the key file** — not implemented. It would need a KDF over
-  the passphrase, a way to enter it on the device, and a recovery path for a
-  forgotten phrase — that is the cost, and it is why the card's files are the
-  boundary today.
+- **A passphrase over the files** — implemented in the reference firmware: the
+  identity, the counter, the revocation list and each peer's replay window are
+  stored as AES-256-GCM containers (a PBKDF2-HMAC-SHA256 key, one salt per card,
+  each container bound to its own file name), with the passphrase typed on the
+  device at boot. That is the third layer, and it is the one that protects the
+  *card* at rest: a card reader gets ciphertext. It buys no recovery — by
+  design, there is no recovery phrase, escrow or hardware-derived fallback, so
+  forgetting the passphrase leaves the files unrecoverable and the only way back
+  is to wipe the card and mint a new identity. Cached peer announces stay
+  plaintext, since a relay or a neighbour broadcasts them in the clear anyway.
 
 Flash encryption and secure boot protect the flash; neither covers the removable
-card, which stays in the clear unless the app encrypts what it writes (it does
-not). So a card reader still *is* the identity, and the files are still readable
-and rollback-able, until the identity lives somewhere else — an encrypted NVS
-partition rather than the card. The node reports which measures are on at boot
-and on demand with the `i` console command, and the enablement route for this
-board and framework, with what the vendor framework does and does not expose, is
-documented with the firmware — see
+card, which stays in the clear unless the app encrypts what it writes — the
+passphrase store is that app-level encryption, so with it a card reader no
+longer *is* the identity. Without any of the three, a card reader is the
+identity and the files are readable. Rollback survives the passphrase store
+either way: an older-but-valid container is still a valid container, so the
+rollback exposure the storage section above describes does not go away with the
+passphrase. The node reports which measures are on at boot and on demand with
+the `i` console command, and the enablement route for this board and framework,
+with what the vendor framework does and does not expose, is documented with the
+firmware — see
 [Seeing the posture (and turning it on)](examples/cardputer/README.md#seeing-the-posture-and-turning-it-on).
 
 ## Examples & tests
@@ -770,6 +801,7 @@ documented with the firmware — see
 - [`test/test_cosechat.c`](test/test_cosechat.c) — protocol test suite (canonical form, field size contracts, coverage, replay classes, announce/presence lifecycles, link handshake and sequence window, rotation and revocation, key seeds)
 - [`test/test_road.c`](test/test_road.c) — road framing (fragmentation/reassembly) tests
 - [`test/test_relay.c`](test/test_relay.c) — relay path learning, forwarding, hijack attempts, budgets, table pressure and a two-hop chain
+- [`test/test_store.c`](test/test_store.c) — the Cardputer example's passphrase store (`examples/cardputer/src/cc_store.c`): container layout, context binding, the damage/auth taxonomy and the locked/no-recovery paths, off-hardware because the module is a medium-free buffer API
 
 ## Known limitations
 
@@ -835,17 +867,21 @@ What this revision of the code does and does not defend:
   per transmitter; two transmitters (or an injector) can disrupt an in-flight
   packet, a repeat is idempotent and a conflicting repeat is rejected, but
   there is no per-sender demultiplexing by design.
-- **The card is the identity, in the clear, and its files are not tamper-proof**
+- **The card is the identity, and its files are not tamper-proof**
   — `/cc/key.bin` holds the identity unencrypted as seeds (the two 64-byte seeds
-  and `sign_pub`), so physical access to the card is permanent impersonation
-  plus retroactive decryption of anything captured. The counter, replay and
-  revocation files are trusted as read, so an older-but-valid copy is accepted
+  and `sign_pub`) unless the firmware's passphrase store is set, in which case
+  the sensitive files are AES-256-GCM containers and the passphrase, not the
+  card, is the boundary (with no recovery: a forgotten passphrase means wiping
+  the card and minting a new identity). Either way, physical access to an
+  unsealed card is permanent impersonation plus retroactive decryption of
+  anything captured. The counter, replay and revocation files are trusted as
+  read, so an older-but-valid copy is accepted
   (reused counters, one replayed packet, a re-trusted retired identity, a
   rotated-away key), and the per-file envelope's CRC detects damage rather than
   authenticating it. A damaged key file — or no card at all — fails closed
   rather than re-identifying the node. The full picture, including the two
-  key-file forms and what is not implemented (no flash encryption, no secure
-  boot, no passphrase), is in [Storage posture](#storage-posture).
+  key-file forms and what is off by default (flash encryption, secure boot, and
+  the store passphrase), is in [Storage posture](#storage-posture).
 - **The radios are untested on hardware here** — this repo's host tests cover
   the protocol, the framing and the relay only, not any radio path on a device.
 - **The `link_id` and suite byte are provisional** — the handshake carries an
