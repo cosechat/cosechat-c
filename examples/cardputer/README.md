@@ -40,13 +40,11 @@ one fragment. A presence is one fragment either way.
 | Enter | send the message to the selected peer |
 | Del | backspace |
 
-The serial console takes eight commands:
-- `r` (rotate identity), `x` (revoke it), `n` (mint a new identity — the
-  recovery path for a damaged key file or a cardless run, see "What the card
-  *is*"), and `w` (wipe the card); `n` takes `y`, `w` takes a capital `Y`, and
-  either prompt is cancelled by any other key or by a five-second timeout.
-- `g` (create a group), `j<hex>` (join one), `s` (share its secret over an open
-  link), `p<text>` (post to it). See "Groups".
+The serial console takes five commands: `r` (rotate identity), `x` (revoke it),
+`n` (mint a new identity — the recovery path for a damaged key file or a
+cardless run, see "What the card *is*"), `w` (wipe the card) and `i` (print the
+security posture); `n` takes `y`, `w` takes a capital `Y`, and either prompt is
+cancelled by any other key or by a five-second timeout.
 
 The status bar shows the first 4 bytes of this node's address, or `no id` while
 the node is inert (no identity).
@@ -57,9 +55,7 @@ AEAD record on an open session, `(signed)` for the opportunistic signed chat
 used while a handshake is still in flight. An `RX` chat line always means the
 packet authenticated: a forged or replayed one never reaches the display, and
 shows as `<hex> bad signature`, `<hex> no key (key_req)` or `<hex> decrypt
-failed`, while replays are counted silently. A group post is shown as
-`[grp <gid4> <poster4>] text` and is always a post that decrypted; the poster
-half is a *self-claimed label*, not a verified identity (see Groups). Sessions
+failed`, while replays are counted silently. Sessions
 log `link_req`,
 `link_proof`, `link open`, `link close` and `<hex> identify verified`; a data
 record on a session we accepted is dropped (and counted) until a verified
@@ -70,11 +66,9 @@ announce; anything else is logged as `<hex> (unverified)`, and accepted
 presences are folded into at most one `PRE` line per second (with a `+N`
 count), so a presence flood cannot drive the display. A periodic pair of `Sys`
 lines reports the road counters (`rx drop tx fail`) and the drop reasons
-(`rp sig nokey dec cd ann v link rot rev ctl grp`), plus a third line when the
+(`rp sig nokey dec cd ann v link rot rev ctl`), plus a third line when the
 relay is compiled in (see Relay below). `cd` counts chats refused by the chat
-verify budget and `grp` counts group posts refused (a spent verify budget, or a
-post whose PoW or tag did not verify — a full label table no longer refuses
-anything, it evicts the least recently verified label; see Groups).
+verify budget.
 
 ## How it works
 
@@ -132,12 +126,6 @@ anything, it evicts the least recently verified label; see Groups).
 - **Identities rotate and retire (v9).** `ROTATE` (9) moves an identity to a
   new key, co-signed by the old one; `REVOKE` (10) retires an identity
   permanently. Both are handled below.
-- **Groups (v0.10, still wire revision 9).** `GROUP_DATA` (11) is a broadcast
-  post sealed under a shared 32-byte secret — a new *type* inside revision 9,
-  which is why it is additive: a receiver that does not know the type drops it
-  as `CC_E_FORMAT`, and so does a relay built before the type existed (group
-  traffic therefore crosses a mesh only where every relay on the path knows it).
-  This build does carry it. See "Groups" below.
 
 ## Links
 
@@ -194,24 +182,18 @@ into a signature oracle.
 RAM budget: the big static objects are the `cc_work_t` scratch (~34 KB), the
 peer key cache (16 × (1952 + 1184) ≈ 50 KB), the rotation key (~13 KB, live
 only while a rotation is published, but statically reserved) and the wire
-scratch buffers; the envs build at 67–76% of the ESP32-S3's 320 KB DRAM, with
-`wifi` the tightest at ~75.4%. Additions from the security and group work are
-small and named: the revocation-load scratch (224 B), the chat and group verify
-budgets (~136 B), and the group state — `cc_group_t` 44 B, `GROUP_WIN_MAX` 8
-replay windows (8 × 64 B = 512 B), the throwaway window an unseen label is
-parsed against (64 B), the decrypted-post scratch (552 B), the post TX buffer
-(`CC_GROUP_BUF_SZ` 752 B) and the console text argument (513 B). The envelope,
-the mint and the wipe add no static data of their own (a CRC with no table,
-locals only): the card-hardening pass measures **+280 B** (`wifi` 247048 →
-247328 B, 75.4% → 75.5%), the seed-form key file a further **+256 B** (`wifi`
-247328 → 247584 B) — mostly the library's own `cc_key_t` growth (136 B) plus the
-key-file scratch buffers — and the storage-audit fixes **+8 B** (`wifi` 247584 →
-247592 B, 75.5% → **75.6%**). Nothing allocates.
+scratch buffers; the envs build at 66–75% of the ESP32-S3's 320 KB DRAM, with
+`wifi` the tightest at ~74.8% (244984 B; lora 219088, lora-relay 227872, ble
+229936, dot11 242988). Additions from the security and card work are small and
+named: the revocation-load scratch (224 B), the chat verify budget (72 B), the
+envelope (a CRC with no table, locals only), the seed-form key scratch and the
+console state. Nothing allocates.
 
 ## Identity: rotation and revocation
 
-Two serial console commands drive the identity paths, because a path nobody can
-exercise rots:
+Four serial console commands drive the identity and card paths, because a path
+nobody can exercise rots (`r` and `x` here, `n` and `w` under "Wipe and
+re-key"):
 
 | Command | What it does |
 |---------|--------------|
@@ -286,100 +268,6 @@ Receive side, in the order the header states:
 A rotation is re-broadcast every announce interval for `ROTATE_GRACE_MS` (5 min)
 so peers that missed the first copy can still move their trust.
 
-## Groups
-
-A **group** is a set of members sharing one 32-byte secret. There is no
-membership protocol, no epochs and no sender keys: the secret *is* the group and
-the gid is derived from it (`SHA-256("cosechat/group gid" | secret)[0:8]`), so
-membership changes never move the group's address. **Removal is a new group** —
-a new secret, hence a new gid. Someone who has left still knows the old secret
-and can still read (and mint) anything derived from it, so making a new group
-and telling the others is the only thing that actually excludes them.
-
-| Command | What it does |
-|---------|--------------|
-| `g` | create a group: mint a random secret, print it as hex, persist it, start listening |
-| `j<hex>` | join with a typed 64-hex secret (Enter not required; a newline works too) |
-| `s` | share the secret over an open link with the selected peer (a convenience, see below) |
-| `p<text>` | post `<text>` to the group (line ends at Enter) |
-
-The hex `g` prints is how the secret is shared out of band: read it on the other
-node with `j`. It is stored in the clear in `/cc/group.bin`, like the node key
-in `/cc/key.bin`; **anyone who reads the card is a member**, and the file is not
-tamper-proof. The same file carries our post sequence, saved on the same drift
-cadence as the outbound counter, so a reboot cannot repeat a `(gid, poster,
-seq)` a receiver has already accepted.
-
-Receive side. A group post (`CC_MSG_GROUP_DATA`) is **broadcast and carries no
-recipient**, so it cannot go through the recipient-filtered chat branch; it has
-one of its own:
-
-- With **no group joined** it is dropped at the cheapest possible point: no
-  budget is spent and no crypto runs, because the gid that would identify our
-  group does not exist yet.
-- With a group joined, the gid is compared first (a plain decode); the gid is
-  on the air in every post, so this is a filter rather than a secret, and it is
-  there so another group's post — or a stranger's garbage — never spends a
-  verify-budget slot that legitimate posts need.
-- A post for our group then spends a verify budget (`GROUP_VERIFY_BURST` per
-  `GROUP_VERIFY_WINDOW_MS`, `MAX_PEERS` per 4 s) **before** the work. A post
-  costs a PoW check (`CC_POW_DIFFICULTY_GROUP`) plus the AEAD attempt, and one a
-  member captured is cheap to replay, so on WiFi/802.11 an unbudgeted verifier
-  would be saturated. A refusal is counted (`grp` in the stats line) and dropped
-  without a display line.
-- An unseen poster label is parsed against a **throwaway window** first and
-  claims a slot in the table only if that parse authenticates, so a stranger —
-  anyone at all, who has merely seen one post and therefore knows the gid, which
-  is on the air in every post — cannot take slots with junk labels and make the
-  node deaf to members whose labels it has not seen yet (a new member's first
-  post, or a member's post after a rotation). Nothing an outsider sends reaches
-  the table. One mined packet is also spent before the table is touched
-  (`CC_POW_DIFFICULTY_GROUP`), so churn costs the sender something.
-- The bound is `GROUP_WIN_MAX` = 8 labels. When the table is full the **least
-  recently verified** label's window is evicted rather than a new label refused:
-  refusing would let anyone who can mine a few packets fill the table into
-  permanent deafness, and eviction only loses that label's replay state — its
-  old post could then be displayed a second time. The order comes from the
-  window's own `last_seen`, which `cc_group_post_parse()` stamps on every
-  verified post (a window that never verified is dropped first — the label-flood
-  case), so no parallel clock is kept. That trade is deliberate and cheap: a post
-  mutates no app state, and a replay window exists to stop a *re*action, not to
-  suppress duplicate text. A window is never silently reset while it is live; it
-  is replaced, and the replacement is what the least-recently-verified rule makes
-  predictable.
-- An accepted post is displayed as `[grp <gid4> <poster4>] text` in its own
-  colour. **The poster label is self-claimed and NOT a verified identity**: every
-  member holds the same key and can seal any label, so any member can mint
-  another member's label. The library's own suite pins that limit as a test
-  (`group_member_can_forge_another_label` in `test/test_cosechat.c`), and the
-  residual is real in the other direction too — a member can silence another by
-  minting a high sequence under its label. Only per-post signatures would change
-  that, at ~3.3 KB per post, and they are deliberately out of scope. No policy
-  in this app depends on the poster field.
-
-Provisioning is **out of band** (`g` prints the secret, `j<hex>` takes it),
-which is the path that works when members are not adjacent to each other. As a
-convenience for peers that do happen to share an open link, `s` sends the secret
-as one `CC_LINK_KIND_GROUP_KEY` link record, and a node that receives one joins
-that group. The record is authenticated by the link key and the link's own
-sequence window is its replay defence, exactly as for a data record (the
-handshake that opened the session was the budgeted work); but because it
-**replaces** this node's group, it is accepted only from a link whose peer has
-already proved its address, the same standard `LINK_REQUIRE_IDENTIFY` holds
-data to.
-
-**The relay carries group posts.** Under `CC_RELAY`, every post — for our group
-or another — is offered to `cc_relay_group()`, the module's own entry point for
-this class: it has its own airtime pool (`CC_RELAY_AIRTIME_GROUP`), a per-gid
-post budget (`CC_RELAY_GROUP_BUDGET`), its own hop cap
-(`CC_RELAY_MAX_HOPS_GROUP`) and the keyless PoW gate (`CC_POW_DIFFICULTY_GROUP`)
-before any budget is spent, and a refusal leaves the table and the budgets
-untouched. The offer happens **first and unconditionally**, before anything
-local: whether we join the group or not, and whether our own budget refuses the
-post, changes nothing about the mesh's traffic being carried. Our own group's
-posts are forwarded too (see the Relay section) — a post is fan-out, not a
-unicast to us.
-
 ## Relay (opt-in)
 
 The `lora-relay` env defines `CC_RELAY` and compiles in `cc_relay_t` (a
@@ -388,37 +276,26 @@ the `lora` road and flags, so a build break in the relay path is visible even
 though the other four envs do not include it.
 
 When it is on, every accepted (signature-verified) announce is offered to
-`cc_relay_announce`, every chat **not addressed to us** to
-`cc_relay_forward`, and **every** group post — ours and another group's alike —
-to `cc_relay_group`; anything the module answers with `CC_RELAY_FWD` is sent
-with the road. A chat for us is delivered locally and never re-broadcast, and
-our own announce is never forwarded. A group post is forwarded even when it is
-for a group we are in: a post is fan-out rather than a unicast to us, so
-members we cannot reach still need it carried, and the duplicate we create is
-dropped downstream by a receiving member's per-poster window (and here by the
-module's duplicate cache) — the same rule the app already follows for an
-announce, which it both learns from and re-broadcasts. **Link traffic is never
-offered at all**: a link record carries no destination, and a link only exists
-between direct peers.
+`cc_relay_announce` and every chat **not addressed to us** to
+`cc_relay_forward`; anything the module answers with `CC_RELAY_FWD` is sent with
+the road. A chat for us is delivered locally and never re-broadcast, and our own
+announce is never forwarded. **Link traffic is never offered at all**: a link
+record carries no destination, and a link only exists between direct peers.
 
 Tuning is in `platformio.ini`. The medium-modelling values are left at their
 defaults because the defaults *are* this road — one SF7 / 125 kHz LoRa channel,
-which the three airtime pools model together: `CC_RELAY_AIRTIME_ANNOUNCE`
-16384 B, `CC_RELAY_AIRTIME_DATA` 16384 B and `CC_RELAY_AIRTIME_GROUP` 8192 B per
-60-tick window (40960 B per window, ~683 B/s; three pools so that one 6.5 KB
-announce cannot black out relayed data for the whole window and a post storm
-cannot silence a conversation), with `CC_RELAY_FWD_BUDGET` 3 per destination,
-`CC_RELAY_GROUP_BUDGET` 2 per group, `CC_RELAY_DUP_TTL` 300,
-`CC_RELAY_PATH_TTL` 600, `CC_RELAY_MAX_HOPS` 8 and `CC_RELAY_MAX_HOPS_GROUP` 8;
-the relay's clock is seconds (`millis() / 1000`) to match those tick units.
-Only the RAM-shaped knobs are cut: `CC_RELAY_PATHS` 16, `CC_RELAY_DUP` 16,
-`CC_RELAY_BUDGETS` 8 and `CC_RELAY_GIDS` 8, which makes `cc_relay_t` 1516 B
-instead of the default 4460 B (measured with `sizeof` under the env's defines:
-16 paths × 48 B, 16 duplicate slots × 20 B, 8 budget slots × 24 B, 8 group
-slots × 16 B, the window and three pool counters, and 92 B of counters), plus a
-7 KB re-broadcast buffer (`CC_ANN_BUF_SZ + 1` = 7024 B) and the 8-entry pin
-table; the whole relay env costs 8928 B (~8.9 KB) of RAM over the plain lora
-build (measured: 230080 B vs 221152 B).
+which the two airtime pools model together: `CC_RELAY_AIRTIME_ANNOUNCE`
+16384 B and `CC_RELAY_AIRTIME_DATA` 24576 B per 60-tick window (40960 B per
+window, ~683 B/s; two pools so that one 6.5 KB announce cannot black out relayed
+data for the whole window), with `CC_RELAY_FWD_BUDGET` 3 per destination,
+`CC_RELAY_DUP_TTL` 300, `CC_RELAY_PATH_TTL` 600, `CC_RELAY_WINDOW` 60 and
+`CC_RELAY_MAX_HOPS` 8; the relay's clock is seconds (`millis() / 1000`) to match
+those tick units. Only the RAM-shaped knobs are cut: `CC_RELAY_PATHS` 16,
+`CC_RELAY_DUP` 16 and `CC_RELAY_BUDGETS` 8, which makes `cc_relay_t` 1380 B
+instead of the default 4196 B (measured with `sizeof` under the env's defines:
+16 paths × 48 B, 16 duplicate slots × 20 B, 8 budget slots × 24 B, the window,
+the two pool counters and 88 B of counters), plus a 7 KB re-broadcast buffer
+(`CC_ANN_BUF_SZ + 1` = 7024 B) and the 8-entry pin table.
 
 The origin check depends on the road, and where the road can attribute a sender
 the app pins it. `cc_road_t` reports the transmitting source it heard a packet
@@ -458,15 +335,7 @@ The third `Sys` line reports relay activity: `fwd`/`rx`, then the refusals
 (`dup`, `bud` for budget, `unk` for no path, `pow` for unmined data, `org` for
 the module's own origin check, `pin` for the hops-0 claims this app refused for
 want of a pin, `repin` for pins taken after a lapse, `oth` for everything else),
-so a drop reason is never invisible. It ends with the group class, which the
-module accounts for in its own pool: `grp` is the group-post bytes relayed in the
-current window against `CC_RELAY_AIRTIME_GROUP` (the counters in
-`cc_relay_stats_t` are per class only for the pools; the cumulative figures are
-total `airtime`, so the group pool's *window* figure is what the line shows).
-Group refusals are counted in the same `e_*` fields as the other classes (`pow`
-for an unmined post, `bud` for a spent per-group or pool budget, `dup` for a post
-already forwarded, `oth` for `E_TYPE`/`E_MAXHOPS` and the rest), so the
-per-class split is in the byte pools rather than in the refusal counters.
+so a drop reason is never invisible.
 
 ## SD card layout
 
@@ -477,7 +346,6 @@ envelope               "CCFS" <version 1> <crc32 LE of the payload>
 /cc/key.bin            envelope + <form><seeds><sign_pub>             (2090 B)
 /cc/counter.bin        envelope + <magic 0xCC><version><counter le32> <seq le32> [<flags>]
 /cc/revoked.bin        envelope + <version><REVOKED_MAX cc_revoked_t>  (retired identities)
-/cc/group.bin          envelope + <version><secret 32><seq le32>      (the group secret)
 /cc/peers/<hex>.bin    envelope + <version><raw cc_announce_t>
 /cc/peers/<hex>.rp     envelope + <version><unsigned cc_replay_t><authed cc_replay_t>
 ```
@@ -555,15 +423,13 @@ a reader:
 | File | In the clear | What a card reader gets |
 |------|--------------|--------------------------|
 | `/cc/key.bin` | yes | the node's private identity — it holds the two 64-byte seeds the keys are rebuilt from, and it can impersonate this node to every peer |
-| `/cc/group.bin` | yes | a group member — it can read and mint group posts |
 | `/cc/counter.bin` | yes (not secret) | the values peers use to decide what is fresh, plus the retired flag |
 | `/cc/revoked.bin` | yes | which identities this node has retired |
 | `/cc/peers/<hex>.bin` | public data anyway | every cached peer announce (public keys, name, price) |
 | `/cc/peers/<hex>.rp` | yes | the replay windows, i.e. how far each peer has counted |
 
-So: **the card is the identity**, and a group secret on the card is a
-membership. Physical possession is the security boundary; the files are
-crash-proof, not tamper-proof.
+So: **the card is the identity**. Physical possession is the security boundary;
+the files are crash-proof, not tamper-proof.
 
 Two consequences, stated because they are real:
 
@@ -584,13 +450,10 @@ Two consequences, stated because they are real:
   nothing and drops every packet before any work, shows `no id` in the status
   bar, and says so on the log. `n` (then `y`) is the deliberate way out — it
   mints a new identity at a new address, which means peers must re-learn this
-  node and any group membership must be re-provisioned. The same state is
-  entered after a wipe. `/cc/group.bin` that is present but invalid does the
-  same for the group: group traffic is refused until the operator re-joins
-  (`j<hex>`) or creates a new group (`g`).
+  node. The same state is entered after a wipe.
 - **A missing `key.bin` on a card that has other state is damage, not a first
   boot.** The node generates a key automatically only when the card is empty of
-  *our* files: `counter.bin`, `group.bin`, `revoked.bin`, or peer files matching
+  *our* files: `counter.bin`, `revoked.bin`, or peer files matching
   our own naming (`/cc/peers/<32 hex>.bin|.rp`). A stray foreign file in
   `/cc/peers` is not state and does not block a first boot.
 
@@ -606,26 +469,95 @@ fail-safe:
 
 | File | Present but invalid |
 |------|---------------------|
-| `group.bin` | refuse group traffic, loud log with the way out (`j`/`g`) |
 | `counter.bin` | treat as absent (reseed from the RNG) **and log it** — peers may reject traffic until the counters pass their windows |
 | `revoked.bin` | treat as absent (empty list) **and log it** — retired identities are trusted again until they are revoked once more; the durable fix is to rotate away from a leaked key |
 | `peers/<hex>.bin` | skip the file **and log a count**; an unknown payload version is treated the same way — the peer simply re-announces |
 | `peers/<hex>.rp` | start fresh windows for that peer **and log it** — a captured packet may replay once |
 
+### Seeing the posture (and turning it on)
+
+The node **reports** the platform's security posture; it never gates on it. At
+boot it prints a short block, and `i` prints the same on demand (the only
+difference is the first word):
+
+```
+Sys: boot: id 1a2b3c4d, sd mounted
+Sys: flash enc off, secure boot off
+Sys: protects: key.bin counter.bin revoked.bin peers/*
+Sys: off: a card reader IS this node; files readable + rollback-able
+```
+
+`flash enc on, secure boot on` is printed in green and the last line disappears;
+anything else is amber plus that red line. `sd ABSENT` replaces `mounted` when
+there is no card, and `id no id` when the node is inert.
+
+Where the answers come from: `esp_flash_encryption_enabled()` (bundled ESP-IDF
+`tools/sdk/esp32s3/include/bootloader_support/include/esp_flash_encrypt.h`,
+static inline at line 48) reads the flash-encryption efuse; `esp_secure_boot_enabled()`
+(same directory, `esp_secure_boot.h`, static inline at line 62) reads the
+secure-boot state via the ROM, and returns false when secure boot is not built
+into the bootloader. Both are header-only inlines in the framework this project
+already uses, so the queries need no build flag, no dependency and no library —
+and on a plain build they simply answer "off", which is the truth.
+
+**Nothing here is enabled by default, and no code path in this node assumes it.**
+A plain build is exactly today's behaviour: the boot line and `i` exist so the
+operator can see which side of the line they are on rather than infer it from
+prose.
+
+Enabling them, for this board (`esp32-s3-devkitc-1`) with this framework
+(PlatformIO `platform = espressif32@6.7.0`, `framework = arduino`,
+arduino-esp32 2.0.16 / ESP-IDF 4.4) — what I checked, and what it means:
+
+- They are **bootloader and fuse** features, not application flags. In IDF terms
+  the knobs are `CONFIG_SECURE_BOOT` and `CONFIG_SECURE_FLASH_ENC_ENABLED`.
+- **They cannot be turned on from `platformio.ini` in this configuration.**
+  The Arduino builder in this platform has no sdkconfig hook at all (no
+  `sdkconfig` reference in `builder/frameworks/arduino.py` in the pinned 6.7.0
+  platform, nor in 6.9.0, nor in the current 7.0.1), and the framework ships a
+  **prebuilt** bootloader with a pre-generated config —
+  `tools/sdk/esp32s3/bin/bootloader_*.elf` and a `tools/sdk/esp32s3/sdkconfig`
+  that says `# CONFIG_SECURE_BOOT is not set` (line 83) and
+  `# CONFIG_SECURE_FLASH_ENC_ENABLED is not set` (line 84). A bootloader you do
+  not build is a bootloader you cannot configure.
+- The path that does exist in this platform is the **`espidf` framework**, whose
+  builder takes `board_build.esp-idf.sdkconfig_path` (defaulting to
+  `sdkconfig.<env>`) and passes it to the build as `-DSDKCONFIG=…`
+  (`builder/frameworks/espidf.py:111-113` and `:862`). That is where the two
+  `CONFIG_` options would be set, together with the partitions and the
+  secure-boot key; arduino-esp32 as an IDF component is the equivalent route on
+  newer arduino-esp32 releases.
+- What each buys: flash encryption makes the app image and the files it writes
+  unreadable off-device (so `/cc/key.bin` and the state files stop being
+  readable, which is the "a card reader IS this node" line going away for the
+  flash); secure boot makes the ROM verify the bootloader and each image, so a
+  modified image will not run. Neither covers the SD card itself: the card is
+  removable and stays in the clear unless the app encrypts what it writes (it
+  does not).
+- What each costs: **burning the efuses is irreversible**, enabling encryption
+  means the flash must be re-flashed/encrypted from then on, and **a lost or
+  wrong key means the device is bricked** — the chip will boot nothing. These
+  are the owner's decisions, not this app's defaults.
+
+What I could not determine here: the exact end-to-end fuse-burning and first
+encrypted-flash sequence for this board (no hardware to try it on), and whether
+a newer arduino-esp32 release exposes a smoother hook than the IDF-component
+route above.
+
 ### Wipe and re-key
 
 `w` then **`Y` (capital)** is the "retire the device / hand over the card" path
-and it **verifies itself**: it removes `key.bin`, `group.bin`, `counter.bin`,
-`revoked.bin` and every file in `/cc/peers/`, then re-checks by existence that
-they are gone. A removal the card refuses — a write-protected card, a failed
-mount, a stuck bus — is reported as `WIPE INCOMPLETE: still present: …` in red
-rather than claimed as done, and the operator is told to erase the card by hand.
-The RAM half cannot fail and happens either way: the identity, the group secret,
-the peer cache with its replay windows, the revocation list, the live sessions,
-the rotation slot (a whole staged private key) and the plaintext scratch buffers
-are wiped, and the counters are reseeded from the hardware RNG — so even a card
-that kept its files leaves a node that is inert and purged. It logs exactly what
-it destroyed, and the node stays inert (`no id`) until `n`.
+and it **verifies itself**: it removes `key.bin`, `counter.bin`, `revoked.bin`
+and every file in `/cc/peers/`, then re-checks by existence that they are gone.
+A removal the card refuses — a write-protected card, a failed mount, a stuck
+bus — is reported as `WIPE INCOMPLETE: still present: …` in red rather than
+claimed as done, and the operator is told to erase the card by hand. The RAM
+half cannot fail and happens either way: the identity, the peer cache with its
+replay windows, the revocation list, the live sessions, the rotation slot (a
+whole staged private key) and the plaintext scratch buffers are wiped, and the
+counters are reseeded from the hardware RNG — so even a card that kept its files
+leaves a node that is inert and purged. It logs exactly what it destroyed, and
+the node stays inert (`no id`) until `n`.
 
 `n` then `y` mints a new identity. It is the recovery path for a damaged or
 missing key file, the way to run without a card, and the deliberate path for
@@ -650,31 +582,25 @@ the replay windows and floods by the rate limits above, not by difficulty.
 make a receiver do expensive work — a 34-byte presence, a 27-byte `key_req`, or
 a `link_req`, which costs the responder a KEM decapsulation plus a signature —
 rather than on the bulk packets this node must mine for itself (an announce,
-the opportunistic chat, a group post, `link_proof` and `identify` all stay at
-difficulty 1; a 4.5 KB chat at difficulty 2 is about a second of mining on a
-desktop host, which an ESP32-S3 cannot afford per message). `link_data`,
-`identify` and `link_close` carry no PoW at all: the handshake prices the
-session and each message is then just an AEAD record. A group post
-(`CC_POW_DIFFICULTY_GROUP`, set to 1 here beside `CC_POW_DIFFICULTY_CHAT`) is in
-the same class: it is broadcast, so it has no single receiver to please, and the
-receiver's own verifier is what the *budget* below protects.
+the opportunistic chat, `link_proof` and `identify` all stay at difficulty 1;
+a 4.5 KB chat at difficulty 2 is about a second of mining on a desktop host,
+which an ESP32-S3 cannot afford per message). `link_data`, `identify` and
+`link_close` carry no PoW at all: the handshake prices the session and each
+message is then just an AEAD record.
 
-Four inbound budgets back this up, all applied *before* the expensive work:
+Three inbound budgets back this up, all applied *before* the expensive work:
 announces are budgeted before their ML-DSA verification (`ANN_VERIFY_BURST`
 per `ANN_VERIFY_WINDOW_MS`, sized so a whole peer table powering up together
 still gets through), `link_req` before the responder's decapsulation and
-signature (`LINK_ACCEPT_BURST` per `LINK_ACCEPT_WINDOW_MS`), a chat
+signature (`LINK_ACCEPT_BURST` per `LINK_ACCEPT_WINDOW_MS`), and a chat
 addressed to this node before `cc_chat_parse()`'s ML-DSA verification
-(`CHAT_VERIFY_BURST` per `CHAT_VERIFY_WINDOW_MS`, a whole peer table per 4 s),
-and a group post before its PoW check and AEAD attempt (`GROUP_VERIFY_BURST`
-per `GROUP_VERIFY_WINDOW_MS`, the same size).
-The chat and group budgets are what bound the CPU on WiFi/802.11, where airtime
-does not:
-a captured valid chat or post is cheap to replay, and without the budget an
-attacker could keep the verifier saturated. The trade-off is stated plainly in
-the source — it also caps the legitimate rate to that burst, which is why the
+(`CHAT_VERIFY_BURST` per `CHAT_VERIFY_WINDOW_MS`, a whole peer table per 4 s).
+The chat budget is what bounds the CPU on WiFi/802.11, where airtime does not:
+a captured valid chat is cheap to replay, and without the budget an attacker
+could keep the verifier saturated. The trade-off is stated plainly in the
+source — it also caps the legitimate chat rate to that burst, which is why the
 burst is generous (well above any human typing rate, well below a flood), and
-refusals are counted in the stats line as `cd` (chat) and `grp` (group).
+refusals are counted in the stats line as `cd`.
 
 ## Roads
 

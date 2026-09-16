@@ -93,7 +93,8 @@
  * packet can say who sent it, so the relay never grants it. A hops == 0
  * announcement is neither refused nor privileged there — it is one more
  * relayed announcement, and the only protections on a live route are the
- * hops-excluded duplicate digest, the sequence rules and the two budgets.
+ * hops-excluded duplicate digest, the sequence rules and the airtime pools
+ * (with the per-destination data budget inside the data one).
  * Because the newest announcement wins whatever relayed it, an attacker in
  * range must re-race each announcement to hold a route rather than take it
  * once and keep it. That trade is deliberate: recoverability (a route always
@@ -123,9 +124,8 @@
  * Duplicates and budgets. A packet re-broadcast inside CC_RELAY_DUP_TTL is
  * refused as CC_RELAY_E_DUP, whatever its hop count: chats and announcements
  * carry an authenticated freshness value (a monotonic counter, a sequence
- * number) and so does a group post (the poster's sequence, covered by the
- * post's AEAD), and a sender never legitimately repeats any of them
- * byte-for-byte, so a repeat can only be a replay, and the window is long (half
+ * number) that a sender never legitimately repeats byte-for-byte, so a repeat
+ * can only be a replay, and the window is long (half
  * CC_RELAY_PATH_TTL) so a captured packet cannot be re-injected once per short
  * TTL forever. The trade is cache pressure: the cache holds CC_RELAY_DUP
  * digests and evicts the oldest when full, so under heavy traffic the effective
@@ -134,35 +134,31 @@
  * the cache, so a refusal never changes the state it was refused by, and asking
  * twice gets the same answer twice.
  *
- * The traffic a relay carries comes in three classes — announcements (bulk,
- * rare), unicast data, and group posts (broadcast, fan-out) — and each has its
- * own airtime pool, because one pool makes one class starve another: that is
- * why the pools were split in the first place, and a post storm must not
- * silence a conversation any more than a conversation may silence posts. Two
- * of the classes also have a per-key packet budget on top of their pool, so one
- * peer or one group cannot take a whole pool. Five limits in all, all per
- * CC_RELAY_WINDOW ticks, all refusing with CC_RELAY_E_BUDGET and all recovering
- * on the next window: the announce pool, the data pool, the group pool, the
- * per-destination data budget and the per-group post budget. The per-key
- * counters live in tables keyed by address and by gid (not in the path table),
- * so losing a route to table pressure does not hand a destination or a group a
- * fresh budget.
+ * The traffic a relay carries comes in two classes — announcements (bulk,
+ * rare) and unicast data — and each has its own airtime pool, because one pool
+ * makes one class starve the other: an announcement is ~6.5 KB, so a window
+ * sized for one channel admits an announcement OR some data, and a shared pool
+ * would refuse every data packet of that window after a single announcement
+ * was relayed — one announce per window, from anyone, blacked out relayed data
+ * mesh-wide. The data class also has a per-destination packet budget on top of
+ * its pool, so one peer cannot take the whole data pool. Three limits in all,
+ * all per CC_RELAY_WINDOW ticks, all refusing with CC_RELAY_E_BUDGET and all
+ * recovering on the next window: the announce pool, the data pool and the
+ * per-destination data budget. The per-destination counters live in a table
+ * keyed by address (not in the path table), so losing a route to table pressure
+ * does not hand a destination a fresh budget.
  *
  * Traffic is priced on the way through, and a relay needs no keys to do it: the
  * check is one call into the library's own PoW rule (cc_pow_verify_at, which
  * takes the difficulty as a parameter). Unicast data is charged what the
  * destination's own announcement declares it asks senders to mine for chat
  * (its signed admit field), with this build's CC_POW_DIFFICULTY_CHAT as a
- * floor unless CC_RELAY_REQUIRE_POW is off; group posts, which are broadcasts
- * with no destination to read a declaration from, are charged this build's own
- * CC_POW_DIFFICULTY_GROUP. Either way the check happens before any budget or
- * cache slot is spent, so unpaid traffic consumes nothing — and a sender's
+ * floor unless CC_RELAY_REQUIRE_POW is off. The check happens before any budget
+ * or cache slot is spent, so unpaid traffic consumes nothing — and a sender's
  * effective price is the strictest relay on its path, because every relay
- * re-prices. A revision-9 relay that predates the group type has no group
- * entry point at all: it sees CC_MSG_GROUP_DATA as a type it does not carry,
- * refuses it with CC_RELAY_E_TYPE (and forwards nothing), and a receiver drops
- * it as an unknown type. Group traffic therefore crosses a mesh only where
- * every relay on the path knows the type.
+ * re-prices. Anything else — link traffic, presence, key_req, or a type from
+ * another revision of the protocol that this build does not carry — is refused
+ * with CC_RELAY_E_TYPE and forwarded nowhere.
  *
  * A refusal never modifies the packet, the table or the cache; it only moves
  * that refusal's own counter, which is what makes the reasons countable.
@@ -209,32 +205,12 @@ extern "C" {
 #define CC_RELAY_BUDGETS 16
 #endif
 
-/* Per-group budget slots (gid plus a window counter). 16 slots cost 256 B, and
- * they are sized the same way as the destination table: the group pool bounds
- * how many distinct groups can post in one window (a maximum-length post — a
- * 512-byte message, 588 B on the wire, measured here — so 8192 B admits about
- * fourteen of them, and many more short ones; 16 slots therefore cannot be
- * thrashed at the defaults). */
-#ifndef CC_RELAY_GIDS
-#define CC_RELAY_GIDS 16
-#endif
-
 /* A relay never re-broadcasts a packet whose hops would exceed this. The
  * library imposes no hop limit (see include/cosechat.h); this is receiver
  * policy, and a relay is a receiver that pays airtime. 8 hops is ~4x the
  * diameter of a dense LoRa mesh and 8 fragments of overhead at most. */
 #ifndef CC_RELAY_MAX_HOPS
 #define CC_RELAY_MAX_HOPS 8
-#endif
-
-/* Its own cap for group posts, defaulting to the same value. A post is fan-out,
- * not a conversation: its whole point is reaching a group, which may mean
- * travelling further than one chat needs to, while the group pool and the
- * per-gid budget (not this) are what bound what a relay spends carrying it.
- * A separate knob so an operator can raise the reach of broadcasts without
- * loosening what a conversation costs. */
-#ifndef CC_RELAY_MAX_HOPS_GROUP
-#define CC_RELAY_MAX_HOPS_GROUP CC_RELAY_MAX_HOPS
 #endif
 
 /* Duplicate-cache TTL: a packet seen again inside this window is a replay and
@@ -280,45 +256,30 @@ extern "C" {
 #define CC_RELAY_FWD_BUDGET 3
 #endif
 
-/* Per-group post budget: at most this many posts per window are re-broadcast
- * for any one group — the broadcast analogue of the per-destination budget, so
- * one busy or hostile group cannot crowd every other group out of the pool.
- * Two is generous for a group feed on a radio mesh: a post is one packet that
- * serves the whole group, where a conversation needs three to one peer. */
-#ifndef CC_RELAY_GROUP_BUDGET
-#define CC_RELAY_GROUP_BUDGET 2
-#endif
-
 /*
- * Airtime pools, in bytes per window, ONE PER KIND of traffic — announcements,
- * unicast data, group posts — because a shared pool lets one kind starve the
- * others, and each kind has a different reason to be loud: an announcement is
- * ~6.5 KB, so a window sized for one channel (below) admits an announcement OR
- * some data, and every data packet of that window is refused after an
- * announcement is relayed (one announce per window, from anyone, blacked out
- * relayed data mesh-wide); a post storm would do the same to announces and
- * data; and a chat storm would silence posts. Three pools is what makes each
- * class independent: exhausting any one leaves the other two flowing.
+ * Airtime pools, in bytes per window, ONE PER CLASS of traffic — announcements
+ * and unicast data — because a shared pool lets one class starve the other (see
+ * the header's "two classes" note): exhausting either leaves the other flowing.
  *
- * Sized from the packet mix and the road: 16384 B carries ~2.5 announcements
- * (~6.5 KB each), 16384 B ~3.6 chats (~4.5 KB each) and 8192 B ~14 group posts
- * (a maximum-length post is 588 B on the wire, measured with a 512-byte
- * message; a short one is under 100 B) per window — together ~683 B/s across a
- * 60-tick window, inside one SF7 / 125 kHz LoRa channel's payload rate
- * (preamble and framing included) and leaving the rest of the channel to the
- * node's own traffic. A WiFi or Ethernet road raises all three by orders of
- * magnitude (and CC_RELAY_BUDGETS and CC_RELAY_GIDS with them); the pools are
- * the knobs to raise, because the per-kind split, not the total, is what keeps
- * one kind of traffic from silencing another.
+ * Sized from the packet mix and the road, one channel's worth in total. An SF7
+ * / 125 kHz LoRa channel carries ~683 B/s of payload (preamble and framing
+ * included), so a 60-tick window is ~40960 B; the split gives announcements
+ * 16384 B, which carries ~2.5 of them (~6.5 KB each — the bulk traffic a relay
+ * exists to spread), and hands the rest, 24576 B, to data, ~5.4 chats (~4.5 KB
+ * each). The per-destination budget (CC_RELAY_FWD_BUDGET, 3) is sized against
+ * that pool: it bounds one peer to three packets, while sixteen peers all at
+ * their budget would want ~216 KB, so the pool is the real bound and is reached
+ * long before the counters are (a fast road raises both). A WiFi or Ethernet
+ * road raises both pools by orders of magnitude, and CC_RELAY_BUDGETS with
+ * them; the pools are the knobs to raise, because the split, not the total, is
+ * what keeps announcements from silencing data and data from silencing
+ * announcements.
  */
 #ifndef CC_RELAY_AIRTIME_ANNOUNCE
 #define CC_RELAY_AIRTIME_ANNOUNCE 16384
 #endif
 #ifndef CC_RELAY_AIRTIME_DATA
-#define CC_RELAY_AIRTIME_DATA 16384
-#endif
-#ifndef CC_RELAY_AIRTIME_GROUP
-#define CC_RELAY_AIRTIME_GROUP 8192
+#define CC_RELAY_AIRTIME_DATA 24576
 #endif
 
 /* A relay refuses to re-broadcast data that did not pay for admission: every
@@ -412,21 +373,10 @@ typedef struct {
   uint8_t used;
 } cc_relay_budget_t;
 
-/* One group's window accounting, the broadcast analogue of cc_relay_budget_t
- * and keyed the same way (by the gid, not by any table entry): `count` is the
- * posts forwarded for that gid in the window it belongs to. 16 bytes; there
- * are CC_RELAY_GIDS of them. */
-typedef struct {
-  uint8_t gid[CC_GROUP_GID_SZ];
-  uint32_t window;
-  uint16_t count;
-  uint8_t used;
-} cc_relay_gid_t;
-
-/* Counters, all monotonic since cc_relay_init() except `window_announce`,
- * `window_data` and `window_group`, which are the live figures the three pools
- * test against and reset every window. `forwarded` counts packets handed back
- * for re-broadcast; `airtime` their total bytes since init; `rx` every packet
+/* Counters, all monotonic since cc_relay_init() except `window_announce` and
+ * `window_data`, which are the live figures the two pools test against and
+ * reset every window. `forwarded` counts packets handed back for re-broadcast;
+ * `airtime` their total bytes since init; `rx` every packet
  * offered to either entry point; `learned` routes established (a destination
  * that was unknown or stale); `improved` live entries moved to a shorter route;
  * `refreshed` live entries updated in place; `evicted` entries dropped for
@@ -437,7 +387,6 @@ typedef struct {
   uint32_t airtime;
   uint32_t window_announce;
   uint32_t window_data;
-  uint32_t window_group;
   uint32_t learned;
   uint32_t improved;
   uint32_t refreshed;
@@ -467,12 +416,10 @@ typedef struct {
   cc_relay_path_t paths[CC_RELAY_PATHS];
   cc_relay_dup_t dup[CC_RELAY_DUP];
   cc_relay_budget_t budget[CC_RELAY_BUDGETS];
-  cc_relay_gid_t gids[CC_RELAY_GIDS];
   /* start of the current budget window and what each pool has spent in it */
   uint32_t window;
   uint32_t airtime_announce;
   uint32_t airtime_data;
-  uint32_t airtime_group;
   cc_relay_stats_t stats;
 } cc_relay_t;
 
@@ -581,42 +528,6 @@ int cc_relay_forward(cc_relay_t* r, const uint8_t* pkt, size_t pkt_sz,
                      uint32_t now, uint8_t* out, size_t out_sz,
                      size_t* out_len);
 
-/*
- * Forward a group post (CC_MSG_GROUP_DATA, type 11) as the broadcast class it
- * is: a post has no recipient, so cc_relay_forward() is the wrong gate for it
- * (and stays closed to it), and this is its own entry point with its own
- * limits. Decision, in order:
- *   CC_RELAY_E_ARG       NULL, or out == pkt
- *   CC_RELAY_E_FORMAT    not a canonical, complete v9 post envelope
- *   CC_RELAY_E_VERSION   another wire revision
- *   CC_RELAY_E_TYPE      well formed, but not a post: a chat belongs in
- *                        cc_relay_forward(), an announcement in
- *                        cc_relay_announce()
- *   CC_RELAY_E_MAXHOPS   hops at CC_RELAY_MAX_HOPS_GROUP
- *   CC_RELAY_E_POW       the post did not pay this build's
- *                        CC_POW_DIFFICULTY_GROUP (while CC_RELAY_REQUIRE_POW is
- *                        on): a broadcast has no destination to declare a
- * price, so the strictest relay on the path sets it CC_RELAY_E_DUP       this
- * post was already forwarded inside CC_RELAY_DUP_TTL, whatever its hop count
- *   CC_RELAY_E_BUF       out is smaller than pkt + 1
- *   CC_RELAY_E_BUDGET    the per-group budget for that gid, or the group pool,
- *                        is spent for this window
- *   CC_RELAY_FWD         re-broadcast out/out_len: pkt with hops+1
- *
- * The hop cap is checked before the price (the cheapest refusal first, as on
- * the data path), and nothing is charged until the packet is actually
- * re-broadcast, so every refusal above leaves the table, the caches and the
- * budgets exactly as it found them. Posts have their own airtime pool, so a
- * post storm cannot starve announcements or data and a chat storm cannot starve
- * posts; the per-group budget bounds one group the way the per-destination
- * budget bounds one peer.
- *
- * `out` follows the same rule as the other entry points: one byte more room
- * than pkt, no overlap.
- */
-int cc_relay_group(cc_relay_t* r, const uint8_t* pkt, size_t pkt_sz,
-                   uint32_t now, uint8_t* out, size_t out_sz, size_t* out_len);
-
 /* Copy the entry for `addr` into `out` (including the price that address
  * declares it asks senders to mine, so an app can pay it with cc_admit_for()).
  * CC_OK, or CC_RELAY_E_UNKNOWN when there is no live entry (`now` decides: a
@@ -637,13 +548,6 @@ int cc_relay_capacity(const cc_relay_t* r);
  * still reports the budget it already spent. */
 int cc_relay_budget_get(const cc_relay_t* r, const uint8_t addr[CC_ADDR_SZ],
                         uint32_t now, cc_relay_budget_t* out);
-
-/* What `gid` has spent of its per-group post budget in the window `now` falls
- * in (a rolled window has spent nothing), or CC_RELAY_E_UNKNOWN when nothing
- * was forwarded for that group. Like the destination counters, these outlive
- * everything else: they are keyed by the group, not by any packet. */
-int cc_relay_gid_get(const cc_relay_t* r, const uint8_t gid[CC_GROUP_GID_SZ],
-                     uint32_t now, cc_relay_gid_t* out);
 
 /* Copy the counters out. CC_OK, or CC_RELAY_E_ARG for NULL. */
 int cc_relay_stats(const cc_relay_t* r, cc_relay_stats_t* out);

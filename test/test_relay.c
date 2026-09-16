@@ -403,48 +403,26 @@ static size_t t_mint_chat(uint8_t* out, size_t cap, uint8_t hops,
                            CC_POW_DIFFICULTY_CHAT);
 }
 
-#define T_EL_POST_NONCE                                 \
-  6 /* [ver, type, hops, gid, poster, seq, nonce, enc0] \
-     */
-
-/* A group post, structurally valid but authenticating nothing and paying
- * nothing: [ver, type=11, hops, gid(8), poster(16), seq, nonce, encrypt0]. */
-static size_t t_mint_post_raw(uint8_t* out, size_t cap, uint8_t hops,
-                              const uint8_t gid[CC_GROUP_GID_SZ],
-                              const uint8_t poster[CC_ADDR_SZ], uint32_t seq,
-                              uint8_t tag) {
+/* A packet of a type this build does not carry. The type byte is 11, the
+ * first value past the library's last one (CC_MSG_COUNT): a peer on another
+ * revision of the protocol may still send it, and every gate here must refuse
+ * it as an unknown type — the same refusal, for the same reason, as any other
+ * type a relay does not forward. */
+static size_t t_mint_unknown_type(uint8_t* out, size_t cap, uint8_t hops,
+                                  uint8_t tag) {
   t_w w;
-  size_t i;
   w.p = out;
   w.n = 0;
   w.cap = cap;
   w.over = 0;
 
-  t_put_head(&w, 4, 8);
+  t_put_head(&w, 4, 4);
   t_put_head(&w, 0, CC_WIRE_VERSION);
-  t_put_head(&w, 0, CC_MSG_GROUP_DATA);
+  t_put_head(&w, 0, CC_MSG_COUNT); /* a type no current layout defines */
   t_put_head(&w, 0, hops);
-  t_put_head(&w, 2, CC_GROUP_GID_SZ);
-  for (i = 0; i < CC_GROUP_GID_SZ; i++) t_put(&w, gid[i]);
-  t_put_head(&w, 2, CC_ADDR_SZ);
-  for (i = 0; i < CC_ADDR_SZ; i++) t_put(&w, poster[i]);
-  t_put_head(&w, 0, seq);
-  t_put_head(&w, 0, t_nonce_placeholder());
-  t_put_head(&w, 2, 32);
-  t_put_fill(&w, tag, 32);
+  t_put_head(&w, 2, 8); /* something that looks like a body */
+  t_put_fill(&w, tag, 8);
   return w.over ? 0 : w.n;
-}
-
-/* The same, mined at this build's group difficulty: what a sender pays. */
-static size_t t_mint_post(uint8_t* out, size_t cap, uint8_t hops,
-                          const uint8_t gid[CC_GROUP_GID_SZ],
-                          const uint8_t poster[CC_ADDR_SZ], uint32_t seq,
-                          uint8_t tag) {
-  size_t len = t_mint_post_raw(out, cap, hops, gid, poster, seq, tag);
-  if (len == 0 ||
-      t_mine_at(out, len, T_EL_POST_NONCE, CC_POW_DIFFICULTY_GROUP) != 0)
-    return 0;
-  return len;
 }
 
 /* A link_req (which carries no destination on the wire at all) and a
@@ -582,8 +560,6 @@ static void test_sizes(void) {
   static cc_relay_t r;
   static cc_relay_stats_t st;
   cc_relay_budget_t b;
-  cc_relay_gid_t gg;
-  uint8_t gid_probe[CC_GROUP_GID_SZ] = {0};
   size_t bytes;
   cc_relay_path_t p;
 
@@ -600,15 +576,13 @@ static void test_sizes(void) {
         bytes == (size_t)CC_RELAY_PATHS * sizeof(cc_relay_path_t) +
                      (size_t)CC_RELAY_DUP * sizeof(cc_relay_dup_t) +
                      (size_t)CC_RELAY_BUDGETS * sizeof(cc_relay_budget_t) +
-                     (size_t)CC_RELAY_GIDS * sizeof(cc_relay_gid_t) +
-                     4 * sizeof(uint32_t) + sizeof(cc_relay_stats_t));
+                     3 * sizeof(uint32_t) + sizeof(cc_relay_stats_t));
   printf(
       "  (relay %zu bytes: %d paths x %zu B, %d dup x %zu B, %d budgets x "
-      "%zu B, %d gids x %zu B, pools+window %zu B, stats %zu B)\n",
+      "%zu B, pools+window %zu B, stats %zu B)\n",
       bytes, (int)CC_RELAY_PATHS, sizeof(cc_relay_path_t), (int)CC_RELAY_DUP,
       sizeof(cc_relay_dup_t), (int)CC_RELAY_BUDGETS, sizeof(cc_relay_budget_t),
-      (int)CC_RELAY_GIDS, sizeof(cc_relay_gid_t), 4 * sizeof(uint32_t),
-      sizeof(cc_relay_stats_t));
+      3 * sizeof(uint32_t), sizeof(cc_relay_stats_t));
 
   memset(&st, 0xA5, sizeof(st));
   T("stats_copy",
@@ -620,9 +594,6 @@ static void test_sizes(void) {
   T("null_init", cc_relay_init(NULL) == CC_RELAY_E_ARG);
   T("null_stats", cc_relay_stats(NULL, &st) == CC_RELAY_E_ARG);
   T("null_stats_out", cc_relay_stats(&r, NULL) == CC_RELAY_E_ARG);
-  T("null_gid", cc_relay_gid_get(NULL, gid_probe, 0, &gg) == CC_RELAY_E_ARG &&
-                    cc_relay_gid_get(&r, NULL, 0, &gg) == CC_RELAY_E_ARG &&
-                    cc_relay_gid_get(&r, gid_probe, 0, NULL) == CC_RELAY_E_ARG);
   T("null_budget",
     cc_relay_budget_get(NULL, g_node[0].addr, 0, &b) == CC_RELAY_E_ARG &&
         cc_relay_budget_get(&r, NULL, 0, &b) == CC_RELAY_E_ARG &&
@@ -1370,240 +1341,6 @@ static void test_eviction(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Group posts: a broadcast class of their own
- * ------------------------------------------------------------------------- */
-
-static void test_group(WC_RNG* rng) {
-  static cc_relay_t r, r2;
-  static cc_relay_stats_t st;
-  cc_relay_gid_t g;
-  static uint8_t post[CC_GROUP_BUF_SZ * 2];
-  static uint8_t f1[CC_GROUP_BUF_SZ * 2], f2[CC_GROUP_BUF_SZ * 2];
-  uint8_t gid1[CC_GROUP_GID_SZ], gid2[CC_GROUP_GID_SZ], poster[CC_ADDR_SZ];
-  uint8_t type = 0, hops = 0;
-  size_t len, out_len = 0, f1_len = 0, unpaid, chat_len = 0;
-  uint32_t now = 20000;
-  uint16_t g_count_before;
-  int i, ret;
-
-  printf("group posts (type 11, broadcast):\n");
-  cc_relay_init(&r);
-  memset(gid1, 0xA1, sizeof(gid1));
-  memset(gid2, 0xB2, sizeof(gid2));
-  memset(poster, 0xC3, CC_ADDR_SZ);
-
-  /* the other two entry points stay closed to a post, and this one to them */
-  len = t_mint_post(post, sizeof(post), 0, gid1, poster, 1, 0x01);
-  T("post_minted", len > 0);
-  chat_len = t_mint_chat(g_chat, sizeof(g_chat), 0, g_node[1].addr,
-                         g_node[0].addr, 1, 0x0F);
-  T("chat_minted", chat_len > 0);
-  T("forward_refuses_a_post",
-    cc_relay_forward(&r, post, len, now, f1, sizeof(f1), &out_len) ==
-        CC_RELAY_E_TYPE);
-  T("group_refuses_a_chat",
-    cc_relay_group(&r, g_chat, chat_len, now, f1, sizeof(f1), &out_len) ==
-        CC_RELAY_E_TYPE);
-  T("group_refuses_an_announce",
-    cc_relay_group(&r, g_node[0].ann, g_node[0].ann_len, now, f1, sizeof(f1),
-                   &out_len) == CC_RELAY_E_TYPE);
-
-  /* a valid mined post is forwarded, and only its hops element changed */
-  memcpy(g_fwd, post, len);
-  T("forward", cc_relay_group(&r, post, len, now, f1, sizeof(f1), &out_len) ==
-                   CC_RELAY_FWD);
-  f1_len = out_len;
-  T("hops_one", cc_msg_hops(f1, f1_len, &hops) == CC_OK && hops == 1);
-  T("only_hops_changed", t_only_hops_differs(post, len, f1, f1_len));
-  T("input_untouched", memcmp(g_fwd, post, len) == 0);
-  T("type_kept",
-    cc_msg_type(f1, f1_len, &type) == CC_OK && type == CC_MSG_GROUP_DATA);
-  {
-    uint8_t seen[CC_GROUP_GID_SZ];
-    T("gid_kept", cc_group_gid(f1, f1_len, seen) == CC_OK &&
-                      memcmp(seen, gid1, CC_GROUP_GID_SZ) == 0);
-  }
-  T("gid_budget_charged",
-    cc_relay_gid_get(&r, gid1, now, &g) == CC_OK && g.count == 1);
-
-  /* a duplicate inside the TTL, whatever its hop count */
-  T("dup", cc_relay_group(&r, post, len, now, f1, sizeof(f1), &out_len) ==
-               CC_RELAY_E_DUP);
-  T("restamped_dup", cc_relay_group(&r, f1, f1_len, now, f2, sizeof(f2),
-                                    &out_len) == CC_RELAY_E_DUP);
-
-  /* an unmined post is refused, and refused before anything is spent */
-  unpaid = t_mint_post_raw(post, sizeof(post), 0, gid2, poster, 2, 0x02);
-  T("unpaid_minted", unpaid > 0 && cc_pow_verify_at(post, unpaid, 0) != CC_OK);
-  cc_relay_stats(&r, &st);
-  {
-    size_t group_before = st.window_group, fwd_before = st.forwarded;
-    for (i = 0; i < 4; i++) {
-      ret = cc_relay_group(&r, post, unpaid, now, f1, sizeof(f1), &out_len);
-      T(i == 0 ? "unpaid_refused" : "unpaid_refused_again",
-        ret == CC_RELAY_E_POW && out_len == 0);
-    }
-    cc_relay_stats(&r, &st);
-    T("unpaid_costs_nothing",
-      st.window_group == group_before && st.forwarded == fwd_before);
-  }
-  T("unpaid_left_no_gid_budget",
-    cc_relay_gid_get(&r, gid2, now, &g) == CC_RELAY_E_UNKNOWN);
-
-  /* the per-group budget: one group cannot take the whole pool */
-  for (i = 1; i < CC_RELAY_GROUP_BUDGET; i++) {
-    len = t_mint_post(post, sizeof(post), 0, gid1, poster, (uint32_t)(10 + i),
-                      (uint8_t)(0x10 + i));
-    ret = cc_relay_group(&r, post, len, now, f1, sizeof(f1), &out_len);
-    T(i == 1 ? "second_post_forwarded" : "third_post_forwarded",
-      ret == CC_RELAY_FWD);
-  }
-  len = t_mint_post(post, sizeof(post), 0, gid1, poster, 20, 0x20);
-  cc_relay_stats(&r, &st);
-  T("gid_budget_refuses", cc_relay_group(&r, post, len, now, f1, sizeof(f1),
-                                         &out_len) == CC_RELAY_E_BUDGET &&
-                              out_len == 0);
-  T("gid_budget_reason",
-    cc_relay_gid_get(&r, gid1, now, &g) == CC_OK &&
-        g.count == CC_RELAY_GROUP_BUDGET &&
-        st.window_group + (uint32_t)len <= CC_RELAY_AIRTIME_GROUP);
-  /* another group still posts in the same window */
-  len = t_mint_post(post, sizeof(post), 0, gid2, poster, 21, 0x21);
-  T("another_gid_posts", cc_relay_group(&r, post, len, now, f1, sizeof(f1),
-                                        &out_len) == CC_RELAY_FWD);
-
-  /* the hop cap, and one below it */
-  len = t_mint_post(post, sizeof(post), CC_RELAY_MAX_HOPS_GROUP, gid2, poster,
-                    22, 0x22);
-  T("max_hops", cc_relay_group(&r, post, len, now, f1, sizeof(f1), &out_len) ==
-                    CC_RELAY_E_MAXHOPS);
-  len = t_mint_post(post, sizeof(post), CC_RELAY_MAX_HOPS_GROUP - 1, gid2,
-                    poster, 23, 0x23);
-  T("one_below_max", cc_relay_group(&r, post, len, now, f1, sizeof(f1),
-                                    &out_len) == CC_RELAY_FWD &&
-                         cc_msg_hops(f1, out_len, &hops) == CC_OK &&
-                         hops == CC_RELAY_MAX_HOPS_GROUP);
-
-  /* malformed, another revision and a wrong type: refused, nothing changes */
-  T("gid_count_before_refusals",
-    cc_relay_gid_get(&r, gid2, now, &g) == CC_OK && g.count == 2);
-  g_count_before = g.count;
-  len = t_mint_post(post, sizeof(post), 0, gid2, poster, 30, 0x30);
-  T("cut_envelope", cc_relay_group(&r, post, len / 2, now, f1, sizeof(f1),
-                                   &out_len) == CC_RELAY_E_FORMAT &&
-                        out_len == 0);
-  T("truncated", cc_relay_group(&r, post, 1, now, f1, sizeof(f1), &out_len) ==
-                     CC_RELAY_E_FORMAT);
-  {
-    uint8_t* copy = f2;
-    memcpy(copy, post, len);
-    T("patch", t_patch_version(copy, len, (uint64_t)CC_WIRE_VERSION ^ 1) == 0);
-    T("version", cc_relay_group(&r, copy, len, now, f1, sizeof(f1), &out_len) ==
-                         CC_RELAY_E_VERSION &&
-                     out_len == 0);
-    T("version_again", cc_relay_group(&r, copy, len, now, f1, sizeof(f1),
-                                      &out_len) == CC_RELAY_E_VERSION);
-  }
-  T("state_unchanged_by_refusals",
-    cc_relay_gid_get(&r, gid2, now, &g) == CC_OK && g.count == g_count_before);
-
-  /* ---- the pools are three, and none can starve another ---- */
-  cc_relay_init(&r);
-  now = 21000;
-  for (i = 0; i < 40; i++) { /* exhaust the group pool */
-    uint8_t g3[CC_GROUP_GID_SZ];
-    memset(g3, (uint8_t)(0x40 + i), sizeof(g3));
-    len = t_mint_post(post, sizeof(post), 0, g3, poster, (uint32_t)(40 + i),
-                      (uint8_t)(0x40 + i));
-    ret = cc_relay_group(&r, post, len, now, f1, sizeof(f1), &out_len);
-    if (ret != CC_RELAY_FWD)
-      break;
-  }
-  cc_relay_stats(&r, &st);
-  T("group_pool_spent", i < 40 && st.e_budget >= 1);
-  T("announce_still_flows",
-    t_feed(&r, g_node[0].ann, g_node[0].ann_len, g_node[0].addr, 0, now, g_out,
-           &out_len) == CC_RELAY_FWD);
-  len = t_mint_chat(g_chat, sizeof(g_chat), 0, g_node[1].addr, g_node[0].addr,
-                    50, 0x50);
-  T("data_still_flows",
-    cc_relay_forward(&r, g_chat, len, now, g_out, sizeof(g_out), &out_len) ==
-        CC_RELAY_FWD);
-  {
-    /* ... and a post still flows when data is the class that ran out */
-    int dests = 0, chats = 0;
-    cc_relay_init(&r2);
-    for (dests = 0; dests < NDEST - 1; dests++) {
-      if (t_feed(&r2, g_node[dests].ann, g_node[dests].ann_len,
-                 g_node[dests].addr, 0, now, g_out, &out_len) != CC_RELAY_FWD)
-        break;
-    }
-    T("storm_dests_learned", dests == NDEST - 1);
-    for (chats = 0; chats < 16; chats++) {
-      len = t_mint_chat(g_chat, sizeof(g_chat), 0, g_node[NDEST - 1].addr,
-                        g_node[chats % dests].addr, (uint32_t)(100 + chats),
-                        (uint8_t)(0x70 + chats));
-      if (cc_relay_forward(&r2, g_chat, len, now, g_out, sizeof(g_out),
-                           &out_len) != CC_RELAY_FWD)
-        break;
-    }
-    cc_relay_stats(&r2, &st);
-    T("data_storm_spent", chats < 16 && st.e_budget >= 1);
-    len = t_mint_post(post, sizeof(post), 0, gid1, poster, 60, 0x60);
-    T("post_flows_after_a_data_storm",
-      cc_relay_group(&r2, post, len, now, f2, sizeof(f2), &out_len) ==
-              CC_RELAY_FWD &&
-          cc_relay_stats(&r2, &st) == CC_OK && st.window_group == out_len);
-  }
-
-  /* the window rolls: group budgets and pools come back */
-  now += CC_RELAY_WINDOW + 1;
-  len = t_mint_post(post, sizeof(post), 0, gid1, poster, 61, 0x61);
-  T("group_recovers", cc_relay_group(&r2, post, len, now, f1, sizeof(f1),
-                                     &out_len) == CC_RELAY_FWD);
-
-  /*
-   * End to end: a real group post crosses two relays and the far end decrypts
-   * it. The sealer's own AEAD covers gid, poster, seq and the ciphertext, so a
-   * relay that re-stamped anything but hops would break it.
-   */
-  {
-    static cc_group_t grp;
-    static cc_work_t w;
-    static cc_group_win_t win;
-    static cc_group_msg_t msg;
-    static uint8_t chat_pkt[CC_GROUP_BUF_SZ];
-    size_t chat_len = 0, l1 = 0, l2 = 0;
-    const char* text = "hello, group";
-    cc_relay_t ra, rb;
-
-    cc_relay_init(&ra);
-    cc_relay_init(&rb);
-    T("group_create", cc_group_create(&grp, rng) == CC_OK);
-    T("post_build",
-      cc_group_post_build(&w, &grp, g_node[0].addr, 1, (const uint8_t*)text,
-                          strlen(text), chat_pkt, sizeof(chat_pkt), &chat_len,
-                          rng) == CC_OK);
-    T("post_paid", cc_pow_verify_at(chat_pkt, chat_len, 0) == CC_OK);
-    T("relay_one", cc_relay_group(&ra, chat_pkt, chat_len, now, f1, sizeof(f1),
-                                  &l1) == CC_RELAY_FWD &&
-                       cc_msg_hops(f1, l1, &hops) == CC_OK && hops == 1);
-    T("relay_two",
-      cc_relay_group(&rb, f1, l1, now, f2, sizeof(f2), &l2) == CC_RELAY_FWD &&
-          cc_msg_hops(f2, l2, &hops) == CC_OK && hops == 2);
-    T("chain_only_hops_changed",
-      t_only_hops_differs(chat_pkt, chat_len, f2, l2));
-    T("win_init", cc_group_win_init(&win, grp.gid, g_node[0].addr) == CC_OK);
-    ret = cc_group_post_parse(&w, &grp, &win, f2, l2, now, &msg);
-    T("member_decrypts", ret == CC_OK);
-    T("member_message", ret == CC_OK && msg.msg_len == strlen(text) &&
-                            memcmp(msg.msg, text, msg.msg_len) == 0 &&
-                            msg.hops == 2);
-    cc_group_free(&grp);
-  }
-}
-
-/* ---------------------------------------------------------------------------
  * Types a relay does not carry
  * ------------------------------------------------------------------------- */
 
@@ -1638,8 +1375,19 @@ static void test_types(void) {
   /* and neither of them entered the duplicate cache */
   T("link_data_again", cc_relay_forward(&r, pkt, len, now, g_out, sizeof(g_out),
                                         &out_len) == CC_RELAY_E_TYPE);
+
+  /* a type from another revision of the protocol: refused like the rest, and
+   * not cached either */
+  len = t_mint_unknown_type(pkt, sizeof(pkt), 0, 0x11);
+  T("unknown_type_minted", len > 0 && len < sizeof(pkt));
+  T("unknown_type", cc_relay_forward(&r, pkt, len, now, g_out, sizeof(g_out),
+                                     &out_len) == CC_RELAY_E_TYPE &&
+                        out_len == 0);
+  T("unknown_type_again",
+    cc_relay_forward(&r, pkt, len, now, g_out, sizeof(g_out), &out_len) ==
+        CC_RELAY_E_TYPE);
   T("types_counted",
-    cc_relay_stats(&r, &st) == CC_OK && st.e_type == 4 && st.forwarded == 1);
+    cc_relay_stats(&r, &st) == CC_OK && st.e_type == 6 && st.forwarded == 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1749,15 +1497,14 @@ int main(void) {
 
   wc_InitRng(&rng);
   printf(
-      "cosechat relay  (paths %d, dup %d, budgets %d, gids %d; max hops "
-      "%d/%d; TTLs %d/%d; window %d; %d data per dest, %d posts per group; "
-      "pools %d announce / %d data / %d group B; require pow %d)\n\n",
+      "cosechat relay  (paths %d, dup %d, budgets %d; max hops %d; TTLs "
+      "%d/%d; window %d; %d data per dest; pools %d announce / %d data B; "
+      "require pow %d)\n\n",
       (int)CC_RELAY_PATHS, (int)CC_RELAY_DUP, (int)CC_RELAY_BUDGETS,
-      (int)CC_RELAY_GIDS, (int)CC_RELAY_MAX_HOPS, (int)CC_RELAY_MAX_HOPS_GROUP,
-      (int)CC_RELAY_DUP_TTL, (int)CC_RELAY_PATH_TTL, (int)CC_RELAY_WINDOW,
-      (int)CC_RELAY_FWD_BUDGET, (int)CC_RELAY_GROUP_BUDGET,
+      (int)CC_RELAY_MAX_HOPS, (int)CC_RELAY_DUP_TTL, (int)CC_RELAY_PATH_TTL,
+      (int)CC_RELAY_WINDOW, (int)CC_RELAY_FWD_BUDGET,
       (int)CC_RELAY_AIRTIME_ANNOUNCE, (int)CC_RELAY_AIRTIME_DATA,
-      (int)CC_RELAY_AIRTIME_GROUP, (int)CC_RELAY_REQUIRE_POW);
+      (int)CC_RELAY_REQUIRE_POW);
 
   t_fixture(&rng);
 
@@ -1780,8 +1527,6 @@ int main(void) {
   test_eviction();
   printf("\n");
   test_types();
-  printf("\n");
-  test_group(&rng);
   printf("\n");
   test_chain(&rng);
 

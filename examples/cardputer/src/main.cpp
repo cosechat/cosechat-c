@@ -7,8 +7,7 @@
 //
 //   Tab   = cycle peers        Enter = send chat to selected peer
 //   Serial console: r rotate identity, x revoke it, n mint a new identity,
-//   w wipe the card, g create a group, j<hex> join one, s share its secret,
-//   p<text> post to it ('n' and 'w' ask for a confirmation key).
+//   w wipe the card ('n' and 'w' ask for a confirmation key).
 //
 // SD, under /cc/, every file wrapped in a 9-byte magic+version+CRC envelope:
 //   key.bin         <form byte><keys> -- the SEED form by default
@@ -17,7 +16,6 @@
 //                   loaded from an expanded file.
 //   counter.bin     freshness counter, announce seq, identity-retired flag
 //   revoked.bin     remembered retirements
-//   group.bin       the group secret and our post sequence
 //   peers/<addr_hex>.bin  the cached announce (with a payload version byte)
 //   peers/<addr_hex>.rp   that peer's two replay windows
 // Every peer's public keys are also cached in RAM; SD is the cold store.
@@ -28,6 +26,8 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <SPI.h>
+#include <esp_flash_encrypt.h>
+#include <esp_secure_boot.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -221,46 +221,6 @@ extern "C" {
 // trust; after the grace period only the new identity is published.
 #define ROTATE_GRACE_MS 300000UL
 
-// Group messaging (one group per node; the library's CC_MSG_GROUP_DATA type).
-// A group is a shared 32-byte secret and nothing else: no membership protocol,
-// no epochs, and REMOVAL IS A NEW GROUP (a new secret, hence a new gid). A post
-// is sealed under the group key, so a post that decrypts proves only that
-// someone holding the key made it -- the poster field is self-claimed and
-// non-binding (see the header, and the README's wording).
-//
-// The secret is persisted in one small file under /cc/ because a group that a
-// reboot forgot would silently stop working; it sits there IN THE CLEAR, like
-// the node key, so anyone who reads the card is a member -- the README says so
-// plainly.
-//
-// GROUP_WIN_MAX is the per-poster replay state bound: one window per poster
-// label, allocated only by a post that has AUTHENTICATED (so a stranger who has
-// merely seen one post and learned the gid -- which is on the air -- cannot
-// claim a slot at all), and released only by a group change. When the table is
-// full, the LEAST RECENTLY VERIFIED label is evicted rather than a new label
-// refused: refusing would let anyone who can mine a few packets fill the table
-// and make this node permanently deaf to every unseen label -- a new member's
-// first post, or an existing member's post after a rotation. Evicting loses
-// that label's window, so its old post could be displayed a second time; a post
-// mutates no app state, and the window exists to stop a *re*action, so a
-// duplicate display is the cheap side of that trade. The gid and poster are
-// inside each cc_group_win_t, so two groups or two labels can never share a
-// sequence space.
-#define GROUP_FILE "/cc/group.bin"
-#define GROUP_VERSION 1
-#define GROUP_WIN_MAX 8
-// Group posts are budgeted before their work (a PoW check plus an AEAD attempt)
-// exactly like a chat, and for the same reason: on WiFi/802.11 a broadcast post
-// is cheap to replay and would otherwise keep the verifier busy. Refusals are
-// counted (statGroupDrop) and dropped without a display line.
-#define GROUP_VERIFY_BURST MAX_PEERS
-#define GROUP_VERIFY_WINDOW_MS 4000UL
-// The group file also carries our post sequence, saved on the same drift
-// cadence the outbound counter uses: a reboot resumes CC_REPLAY_WINDOW past the
-// saved value, so a repeated (gid, poster, seq) -- which a receiver treats as a
-// replay, not a nonce reuse -- cannot happen across a power loss.
-#define GROUP_SAVE_MIN_MS 1000UL
-
 // A presence for a fresh address is cheap to mint and cannot be replay-checked
 // (there is no window for an address we have never seen), so accepted presences
 // are coalesced to at most one log line per PRES_LOG_MS: the canvas blit is
@@ -449,38 +409,6 @@ static int peerSel = -1;
 // would let a retired identity walk straight back in.
 static cc_revoked_t revoked[REVOKED_MAX];
 
-// ---------------------------------------------------------------------------
-// Group state. ONE group per node: the secret (41 B), the per-poster replay
-// windows the library hands over (GROUP_WIN_MAX of them, 56 B each), the
-// decrypted-post scratch and the TX buffer. All static, no heap.
-// ---------------------------------------------------------------------------
-static cc_group_t group; /* used == 0 until we create or join one */
-static cc_group_win_t groupWins[GROUP_WIN_MAX];
-// The throwaway window an unseen label is parsed against: a slot in groupWins
-// is claimed only when that parse AUTHENTICATES, so an outsider who has only
-// seen one post (the gid is on the air) cannot exhaust the table with junk
-// labels and silence members whose labels we have not seen yet.
-static cc_group_win_t groupWinScratch;
-// Slot occupancy. A slot is marked used only when an authenticated post claimed
-// it, and a group change frees the slots of the group it left. The library's
-// own `last_seen` stamp cannot carry this on its own: it is 0 both for a slot
-// we have never used and (in principle) for one verified in the first
-// millisecond after boot, and an eviction decision must not confuse the two.
-static uint8_t groupWinUsed[GROUP_WIN_MAX];
-static cc_group_msg_t groupMsg; /* a decrypted post: 552 B, so static */
-static uint8_t groupBuf[CC_GROUP_BUF_SZ]; /* our own post, before it is sent */
-// Our monotonic post counter. It is per (gid, poster) as far as receivers are
-// concerned, but it is kept monotonic across groups as well, which is simpler
-// and never hurts: a new gid starts every receiver's window from scratch.
-static uint32_t groupSeq = 0;
-static uint32_t groupSeqSaved = 0; /* the value on the card */
-static uint32_t lastGroupSaveTry = 0;
-
-// The receive paths are defined before these helpers, so forward-declare the
-// two they call.
-static void groupDropStaleWins();
-static void groupSave();
-
 // NOT an announce: a deliberately partial cc_announce_t, filled only so the
 // library's two stateless predicates (cc_announce_fresh, cc_presence_matches_
 // announce) have something to read. Only addr, name/name_len, seq and expiry
@@ -641,10 +569,6 @@ static WindowBudget<CTL_VERIFY_BURST> ctlVerifyBudget;
 // before cc_chat_parse() just as annBudget is spent before the announce parse.
 static WindowBudget<CHAT_VERIFY_BURST> chatBudget;
 
-// Verify budget for inbound group posts (see GROUP_VERIFY_*), spent before the
-// PoW check and the AEAD attempt in cc_group_post_parse().
-static WindowBudget<GROUP_VERIFY_BURST> groupBudget;
-
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
@@ -700,8 +624,6 @@ static uint32_t statRotated = 0;  /* rotations accepted for a cached peer */
 static uint32_t statRevoked = 0;  /* packets/peers dropped as retired */
 static uint32_t statCtlDrop = 0;  /* ROTATE/REVOKE refused or unverifiable */
 static uint32_t statChatDrop = 0; /* chats refused by the chat verify budget */
-static uint32_t statGroupDrop =
-    0; /* group posts refused: budget, label table full, or bad post */
 static uint32_t statPeerBad = 0; /* cached peer files skipped as invalid */
 static bool toldOldWire = false;
 
@@ -716,28 +638,6 @@ static void toHex(const uint8_t* b, int n, char* out) {
     out[i * 2 + 1] = HEXDIGITS[b[i] & 0xf];
   }
   out[n * 2] = '\0';
-}
-
-// The inverse, for the console's `j<hex>` argument. Rejects anything that is
-// not hex.
-static int hexNibble(char c) {
-  if (c >= '0' && c <= '9')
-    return c - '0';
-  if (c >= 'a' && c <= 'f')
-    return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F')
-    return c - 'A' + 10;
-  return -1;
-}
-
-static bool fromHex(const char* hex, size_t n, uint8_t* out) {
-  for (size_t i = 0; i < n; i++) {
-    int hi = hexNibble(hex[i * 2]), lo = hexNibble(hex[i * 2 + 1]);
-    if (hi < 0 || lo < 0)
-      return false;
-    out[i] = (uint8_t)((hi << 4) | lo);
-  }
-  return true;
 }
 
 // Overwrite a buffer that held key material. volatile so the compiler cannot
@@ -983,7 +883,7 @@ static int peersOursCount() {
 static int cardHasState() {
   if (!sdInit())
     return FILE_ST_NOCARD;
-  if (sdExists(STATE_FILE) || sdExists(GROUP_FILE) || sdExists(REVOKED_FILE))
+  if (sdExists(STATE_FILE) || sdExists(REVOKED_FILE))
     return FILE_ST_OK;
   return peersOursCount() > 0 ? FILE_ST_OK : FILE_ST_ABSENT;
 }
@@ -1253,8 +1153,8 @@ static void oldWireSeen() {
 // INVALID -- present but the wrong size, unreadable, an unknown form, a failed
 // CRC, or a seed and public key that disagree -- must NEVER be papered over by
 // minting a new identity: that silently re-identifies the node, orphans its
-// links and its group membership, and looks to every peer like a stranger. The
-// caller fails closed instead (see setup()).
+// links, and looks to every peer like a stranger. The caller fails closed
+// instead (see setup()).
 static int keyLoad() {
   static uint8_t ss[CC_SIGN_SEED_SZ], ks[CC_KEM_SEED_SZ];
   static uint8_t sp[CC_SIGN_PRIVKEY_SZ], sb[CC_SIGN_PUBKEY_SZ],
@@ -1829,29 +1729,6 @@ static void handleLinkPacket(const uint8_t* pkt, size_t len) {
     logMsg("RX", buf, YELLOW);
   } else if (kind == CC_LINK_KIND_IDENTIFY) {
     identifyCheck(l, linkRx, plen);
-  } else if (kind == CC_LINK_KIND_GROUP_KEY) {
-    // Group-secret provisioning over an open link, a convenience beside the
-    // typed-secret path. The link key authenticated the record and the link's
-    // own sequence window is its replay defence, exactly as for DATA, so it
-    // needs no budget of its own -- the handshake that opened the session was
-    // the budgeted work. It does REPLACE this node's group, though, so a peer
-    // that has not proved its address does not get to do that (the same
-    // standard DATA is held to when LINK_REQUIRE_IDENTIFY is on).
-    if (!linkPeerKnown(l)) {
-      statLinkDrop++;
-      return;
-    }
-    int gr = cc_group_secret_recv(&work, &group, l, linkRx, plen);
-    if (gr == CC_OK) {
-      groupDropStaleWins();
-      groupSave();
-      char gh[CC_GROUP_GID_SZ * 2 + 1];
-      toHex(group.gid, CC_GROUP_GID_SZ, gh);
-      logMsgf("RX", GREEN, "group %s over link", gh);
-      drawStatus();
-    } else {
-      statLinkDrop++;
-    }
   } else if (kind == CC_LINK_KIND_CLOSE) {
     logMsg("RX", "link close", ORANGE);
     cc_link_forget(l);
@@ -2182,268 +2059,15 @@ static void publishRotation() {
 }
 
 // ---------------------------------------------------------------------------
-// Group plumbing: the persisted secret, the per-poster windows, and the console
-// commands that drive them. One group per node: `g` creates, `j<hex>` joins,
-// `s` shares the secret over an open link, `p<text>` posts.
-// ---------------------------------------------------------------------------
-
-// GROUP_FILE payload: <version><secret 32><seq le32>, wrapped in the envelope.
-// The seq is persisted so a reboot resumes past anything a receiver already
-// accepted; the secret is in the clear, like the node key -- anyone who reads
-// the card is a member.
-static void groupSave() {
-  lastGroupSaveTry = millis();
-  if (!group.used)
-    return; /* never joined: nothing to remember */
-  uint8_t ver = GROUP_VERSION;
-  uint32_t s = groupSeq;
-  uint8_t b[4] = {(uint8_t)s, (uint8_t)(s >> 8), (uint8_t)(s >> 16),
-                  (uint8_t)(s >> 24)};
-  uint8_t hdr[ENV_HDR_SZ];
-  uint32_t c = crc32Update(crc32Start(), &ver, 1);
-  c = crc32Update(c, group.secret, CC_GROUP_SECRET_SZ);
-  c = crc32Update(c, b, sizeof(b));
-  envWriteHeader(hdr, crc32Finish(c));
-  if (!sdAccess(GROUP_FILE, FILE_WRITE, [&](File& f) {
-        return f.write(hdr, ENV_HDR_SZ) == ENV_HDR_SZ &&
-               f.write(&ver, 1) == 1 &&
-               f.write(group.secret, CC_GROUP_SECRET_SZ) ==
-                   CC_GROUP_SECRET_SZ &&
-               f.write(b, sizeof(b)) == sizeof(b);
-      }))
-    return; /* not saved: leave groupSeqSaved alone, so drift stays visible */
-  groupSeqSaved = s;
-}
-
-// Drop the windows of a group we are no longer in. Windows for the CURRENT gid
-// survive a re-join, so rejoining the same group does not forget what we have
-// already accepted (and does not let an old post replay).
-static void groupDropStaleWins() {
-  for (int i = 0; i < GROUP_WIN_MAX; i++) {
-    if (groupWinUsed[i] &&
-        memcmp(groupWins[i].gid, group.gid, CC_GROUP_GID_SZ) != 0) {
-      cc_group_win_forget(&groupWins[i]);
-      groupWinUsed[i] = 0;
-    }
-  }
-}
-
-// Join (or create) the group and make it durable.
-static void groupAdopt(const uint8_t* secret, size_t len, const char* how) {
-  if (len != CC_GROUP_SECRET_SZ || cc_group_join(&group, secret) != CC_OK) {
-    logMsg("Sys", "group join FAILED", RED);
-    return;
-  }
-  groupDropStaleWins();
-  groupSave();
-  char gh[CC_GROUP_GID_SZ * 2 + 1];
-  toHex(group.gid, CC_GROUP_GID_SZ, gh);
-  logMsgf("Sys", GREEN, "%s: group %s", how, gh);
-  logMsg("Sys", "plaintext secret on the card: reader == member", ORANGE);
-  drawStatus();
-}
-
-// Load it at boot. All-or-nothing, like the revocation list: a short, corrupt
-// or wrong-envelope file leaves this node in NO group -- group traffic is then
-// refused (the receive path drops every post while group.used is 0) -- and says
-// so loudly, with the way out, rather than silently dropping the membership.
-static void groupLoad() {
-  uint8_t secret[CC_GROUP_SECRET_SZ];
-  uint32_t seq = 0;
-  bool present = false;
-  bool ok = sdAccess(GROUP_FILE, FILE_READ, [&](File& f) {
-    present = true; /* it opened: a failure below is content, not absence */
-    uint32_t claim = 0;
-    if ((size_t)f.size() != ENV_HDR_SZ + 1 + CC_GROUP_SECRET_SZ + 4)
-      return false;
-    if (!envReadHeader(f, &claim))
-      return false;
-    uint8_t ver = 0;
-    if (f.read(&ver, 1) != 1 || ver != GROUP_VERSION)
-      return false;
-    if (f.read(secret, CC_GROUP_SECRET_SZ) != CC_GROUP_SECRET_SZ)
-      return false;
-    uint8_t b[4];
-    if (f.read(b, 4) != 4)
-      return false;
-    uint32_t c = crc32Update(crc32Start(), &ver, 1);
-    c = crc32Update(c, secret, CC_GROUP_SECRET_SZ);
-    c = crc32Update(c, b, 4);
-    if (crc32Finish(c) != claim)
-      return false;
-    seq = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
-          ((uint32_t)b[3] << 24);
-    return true;
-  });
-  if (!present)
-    return; /* no group was ever joined */
-  if (!ok) {
-    logMsg("Sys", "group.bin INVALID: no group loaded", RED);
-    logMsg("Sys", "groups refused until 'j<hex>' or 'g'", ORANGE);
-    return;
-  }
-  if (cc_group_join(&group, secret) != CC_OK)
-    return; /* cc_group_join leaves the struct wiped: no group this boot */
-  // The same discipline as the outbound counter: resume a whole replay window
-  // past the saved value, so a post sent since the last save cannot come back
-  // as a repeat.
-  groupSeq = seq + CC_REPLAY_WINDOW;
-  groupSeqSaved = groupSeq;
-  char gh[CC_GROUP_GID_SZ * 2 + 1];
-  toHex(group.gid, CC_GROUP_GID_SZ, gh);
-  logMsgf("Sys", GREEN, "group %s loaded", gh);
-}
-
-// Save on the same cadence and drift rule as the outbound counter.
-static void groupMaybeSave() {
-  // Same reasoning as stateMaybeSave(): an inert node (wipe, or a damaged key)
-  // writes nothing back to the card.
-  if (!haveIdentity || !group.used)
-    return;
-  if (millis() - lastGroupSaveTry < GROUP_SAVE_MIN_MS)
-    return;
-  if (groupSeq - groupSeqSaved < CC_REPLAY_WINDOW)
-    return;
-  groupSave();
-}
-
-// The slot holding the committed window for a poster label, or -1 for a label
-// we have never accepted a post from (and for a stale slot left by an earlier
-// group, which a group change frees).
-static int groupWinFind(const uint8_t poster[CC_ADDR_SZ]) {
-  for (int i = 0; i < GROUP_WIN_MAX; i++) {
-    if (groupWinUsed[i] &&
-        memcmp(groupWins[i].gid, group.gid, CC_GROUP_GID_SZ) == 0 &&
-        memcmp(groupWins[i].poster, poster, CC_ADDR_SZ) == 0)
-      return i;
-  }
-  return -1;
-}
-
-// The slot for a label whose post just verified: the first free one, else the
-// label that has gone longest without a verified post. It never refuses, since
-// refusing is what made the table a permanent denial (see GROUP_WIN_MAX): a
-// label's window is replay state, not a security record that must be kept, and
-// losing one costs at most a duplicate display of a very old post. The order
-// comes from the window's own `last_seen`, which cc_group_post_parse stamps on
-// every verified post, so no parallel clock is needed; the subtraction is
-// wrap-safe because millis() is.
-static int groupWinClaim(void) {
-  int oldest = -1;
-  for (int i = 0; i < GROUP_WIN_MAX; i++) {
-    if (!groupWinUsed[i])
-      return i;
-    if (groupWins[i].last_seen == 0)
-      return i; /* never verified: the library's own first choice to drop */
-    if (oldest < 0 ||
-        (int32_t)(groupWins[i].last_seen - groupWins[oldest].last_seen) < 0)
-      oldest = i;
-  }
-  return oldest;
-}
-
-static void createGroup() {
-  cc_group_t fresh;
-  uint8_t secret[CC_GROUP_SECRET_SZ];
-  char hex[CC_GROUP_SECRET_SZ * 2 + 1];
-  if (cc_group_create(&fresh, &rng) != CC_OK) {
-    logMsg("Sys", "group create FAILED", RED);
-    return;
-  }
-  cc_group_secret_export(&fresh, secret);
-  toHex(secret, CC_GROUP_SECRET_SZ, hex);
-  groupAdopt(secret, CC_GROUP_SECRET_SZ, "created");
-  cc_group_free(&fresh);
-  wipe(secret, sizeof(secret));
-  // The only copy the operator gets: shared out of band, typed on the others.
-  logMsg("Sys", "secret ('j' + this on another node):", CYAN);
-  logMsg("Sys", hex, CYAN);
-}
-
-static void joinGroupHex(const char* hex, size_t len) {
-  uint8_t secret[CC_GROUP_SECRET_SZ];
-  if (len != CC_GROUP_SECRET_SZ * 2) {
-    logMsgf("Sys", RED, "group join: want %d hex, got %d",
-            CC_GROUP_SECRET_SZ * 2, (int)len);
-    return;
-  }
-  if (!fromHex(hex, CC_GROUP_SECRET_SZ, secret)) {
-    logMsg("Sys", "group join: not hex", RED);
-    return;
-  }
-  groupAdopt(secret, CC_GROUP_SECRET_SZ, "joined");
-  wipe(secret, sizeof(secret));
-}
-
-// Post to the group. A post is a broadcast sealed under the group key; the
-// poster label is OUR address, which is a label and not proof of authorship.
-static void postGroup(const char* text, size_t len) {
-  if (!haveIdentity) {
-    logMsg("Sys", "no identity: 'n' mints one", RED);
-    return;
-  }
-  if (!group.used) {
-    logMsg("Sys", "no group: 'g' creates one, 'j<hex>' joins", ORANGE);
-    return;
-  }
-  if (len == 0)
-    return;
-  size_t outLen = 0;
-  int ret = cc_group_post_build(&work, &group, myAddr, ++groupSeq,
-                                (const uint8_t*)text, len, groupBuf,
-                                sizeof(groupBuf), &outLen, &rng);
-  if (ret == CC_OK && outLen > 0 && roadSend(groupBuf, outLen)) {
-    char gh[CC_GROUP_GID_SZ * 2 + 1];
-    char disp[CC_MAX_MSG_SZ + 48];
-    toHex(group.gid, 4, gh);
-    snprintf(disp, sizeof(disp), "[grp %s] %.*s", gh, (int)len, text);
-    logMsg("TX", disp, CYAN);
-  } else {
-    logMsgf("Sys", RED, "group post failed (%d)", ret);
-  }
-}
-
-// Share the secret over an OPEN link with the selected peer: a convenience
-// beside the typed-secret path (out-of-band provisioning is what works when
-// members are not adjacent).
-static void shareGroup() {
-  if (!haveIdentity) {
-    logMsg("Sys", "no identity: 'n' mints one", RED);
-    return;
-  }
-  if (!group.used) {
-    logMsg("Sys", "no group to share", ORANGE);
-    return;
-  }
-  if (peerSel < 0 || peerSel >= peerCount) {
-    logMsg("Sys", "no peer selected (Tab)", RED);
-    return;
-  }
-  cc_link_t* link = linkFindPeer(peerAddrs[peerSel]);
-  if (!link || !cc_link_active(link, millis())) {
-    logMsg("Sys", "no open link to the selected peer", ORANGE);
-    return;
-  }
-  size_t len = 0;
-  int ret = cc_group_secret_send(&work, &group, link, millis(), linkBuf,
-                                 sizeof(linkBuf), &len);
-  if (ret == CC_OK && len > 0 && roadSend(linkBuf, len))
-    logMsg("TX", "group secret (link)", CYAN);
-  else
-    logMsgf("Sys", RED, "group share failed (%d)", ret);
-}
-
-// ---------------------------------------------------------------------------
 // Identity lifecycle: mint a new one ('n') and wipe the card ('w'). Both act
 // only after a confirmation keypress, because neither can be undone from here.
 // ---------------------------------------------------------------------------
 
 // Mint a new identity deliberately. The node becomes a stranger to the mesh:
-// the address is new, so peers must re-learn it (an announce does that), the
-// old identity's rotation continuity and any revocation aimed at it are
-// orphaned on the peers' side, and the GROUP membership is unaffected -- the
-// secret is independent of the identity, so our posts just carry a new poster
-// label. This is what recovery from a damaged key file looks like.
+// the address is new, so peers must re-learn it (an announce does that), and
+// the old identity's rotation continuity and any revocation aimed at it are
+// orphaned on the peers' side. This is what recovery from a damaged key file
+// looks like.
 static void mintNewIdentity() {
   if (cc_key_generate(&myKey, &rng) != CC_OK) {
     logMsg("Sys", "keygen FAILED", RED);
@@ -2462,7 +2086,7 @@ static void mintNewIdentity() {
   char hex[CC_ADDR_SZ * 2 + 1];
   toHex(myAddr, 4, hex);
   logMsgf("Sys", GREEN, "new identity %s", hex);
-  logMsg("Sys", "peers must re-learn you: re-provision groups", ORANGE);
+  logMsg("Sys", "peers must re-learn you", ORANGE);
   broadcastAnnounce();
   drawStatus();
 }
@@ -2504,8 +2128,8 @@ static void wipeNote(char* left, size_t n, const char* name) {
 }
 
 // Wipe every trace of this node's identity, from the card and from RAM: the
-// key, the group secret, the freshness counters, the revocation list, the peer
-// cache with its replay state, the live sessions, and each of those files.
+// key, the freshness counters, the revocation list, the peer cache with its
+// replay state, the live sessions, and each of those files.
 // This is the "retire the device / hand the card to someone else" path, and it
 // is the honest counterpart to the README's "the card IS the identity".
 //
@@ -2523,8 +2147,6 @@ static void wipeCard() {
     peers = peersWipeFiles();
     if (!sdRemove(KEY_FILE))
       wipeNote(left, sizeof(left), "key.bin");
-    if (!sdRemove(GROUP_FILE))
-      wipeNote(left, sizeof(left), "group.bin");
     if (!sdRemove(STATE_FILE))
       wipeNote(left, sizeof(left), "counter.bin");
     if (!sdRemove(REVOKED_FILE))
@@ -2533,8 +2155,6 @@ static void wipeCard() {
     // claim that matters is "the files are not there any more".
     if (sdExists(KEY_FILE))
       wipeNote(left, sizeof(left), "key.bin");
-    if (sdExists(GROUP_FILE))
-      wipeNote(left, sizeof(left), "group.bin");
     if (sdExists(STATE_FILE))
       wipeNote(left, sizeof(left), "counter.bin");
     if (sdExists(REVOKED_FILE))
@@ -2545,18 +2165,12 @@ static void wipeCard() {
   }
 
   // RAM: identity (and the rotation slot, which holds a whole private key
-  // whenever a rotation or a mint was staged), group, peers, sessions.
+  // whenever a rotation or a mint was staged), peers, sessions.
   cc_key_free(&myKey);
   cc_key_free(&newKey);
   memset(&newKey, 0, sizeof(newKey));
   memset(myAddr, 0, sizeof(myAddr));
   haveIdentity = false;
-  cc_group_free(&group);
-  for (int i = 0; i < GROUP_WIN_MAX; i++) {
-    cc_group_win_forget(&groupWins[i]);
-    groupWinUsed[i] = 0;
-  }
-  cc_group_win_forget(&groupWinScratch);
   for (int i = 0; i < REVOKED_MAX; i++) cc_revoked_init(&revoked[i]);
   peerCount = 0;
   peerSel = -1;
@@ -2568,20 +2182,16 @@ static void wipeCard() {
   }
   for (int i = 0; i < LINK_MAX; i++) cc_link_forget(&links[i]);
   for (int i = 0; i < LINK_PENDING_MAX; i++) cc_link_forget(&linkPend[i]);
-  // Plaintext scratch that could still hold a message or a decrypted post.
+  // Plaintext scratch that could still hold a message.
   memset(chatBuf, 0, sizeof(chatBuf));
-  memset(groupBuf, 0, sizeof(groupBuf));
-  memset(&groupMsg, 0, sizeof(groupMsg));
   memset(linkRx, 0, sizeof(linkRx));
   // Fresh counters/seq, so nothing the old identity spent is carried forward
   // and the card leaves with no correlatable value on it. The saved markers
   // are levelled too, so nothing is written back until real traffic follows.
   txCounter = esp_random();
   txSeq = esp_random();
-  groupSeq = esp_random();
   txCounterSaved = txCounter;
   txSeqSaved = txSeq;
-  groupSeqSaved = groupSeq;
   revocationPublished = false;
   rotLen = 0;
   rotUntil = 0;
@@ -2589,9 +2199,9 @@ static void wipeCard() {
   if (!card) {
     logMsg("Sys", "WIPE: no card to erase; RAM purged anyway", ORANGE);
   } else if (left[0] == '\0') {
-    logMsgf("Sys", RED, "WIPE: %d peer file(s), key/group/counter/revoked gone",
+    logMsgf("Sys", RED, "WIPE: %d peer file(s), key/counter/revoked gone",
             peers);
-    logMsg("Sys", "WIPE: identity, group secret, sessions gone from RAM", RED);
+    logMsg("Sys", "WIPE: identity and sessions gone from RAM", RED);
   } else {
     logMsgf("Sys", RED, "WIPE INCOMPLETE: still present: %s", left);
     logMsg("Sys", "RAM purged anyway; erase the card by hand", RED);
@@ -2600,16 +2210,13 @@ static void wipeCard() {
   drawStatus();
 }
 
-// A one-character console on the serial port, so the identity, group and
+// A one-character console on the serial port, so the identity and
 // card-lifecycle paths can actually be exercised: 'r' rotates (or, once this
 // identity has been revoked, publishes a fresh identity instead), 'x' revokes,
-// 'g' creates a group, 'j' followed by 64 hex digits joins one, 's' shares the
-// secret over an open link, 'p' followed by text and Enter posts to the group,
-// 'n' mints a new identity, 'w' wipes the card, and 'y' confirms an 'n' or a
-// 'w' (any other key cancels). 'j', 'p' and the two confirmations take an
-// argument or a keypress, so the console collects it before acting. See the
-// README.
-enum { CON_IDLE, CON_JOIN, CON_POST, CON_CONFIRM };
+// 'n' mints a new identity, 'w' wipes the card, 'i' prints the security
+// posture, and 'y' (a capital 'Y' for the wipe) confirms an 'n' or a 'w'; any
+// other key cancels, and a prompt left alone expires. See the README.
+enum { CON_IDLE, CON_CONFIRM };
 static int conMode = CON_IDLE;
 static int conPending = 0; /* 1 = mint an identity, 2 = wipe the card */
 static uint32_t conConfirmAt = 0; /* when the pending confirmation expires */
@@ -2617,10 +2224,45 @@ static uint32_t conConfirmAt = 0; /* when the pending confirmation expires */
 // alone must not be confirmed by a stray 'y' minutes later, and there is no
 // other way for the operator to notice the prompt is still armed.
 #define CONFIRM_MS 5000UL
-static char conBuf[CC_MAX_MSG_SZ + 1]; /* a 'p' line, before it is posted */
-static size_t conLen = 0;
-static char joinHex[CC_GROUP_SECRET_SZ * 2 + 1]; /* a 'j' argument */
-static size_t joinLen = 0;
+
+// ---------------------------------------------------------------------------
+// Platform security posture. This node REPORTS it and never gates on it: a
+// plain build is a plain build, and the operator is the one who has to know
+// which side of the line they are on (see the README's enablement section).
+//
+// Both queries are header-only inline functions in the bundled ESP-IDF
+// (esp_flash_encrypt.h's esp_flash_encryption_enabled(), esp_secure_boot.h's
+// esp_secure_boot_enabled()), so this adds no dependency and no library; the
+// second one returns false when secure boot is not built into the bootloader,
+// which is the honest answer for a build without it.
+// ---------------------------------------------------------------------------
+static bool secFlashEnc = false;
+static bool secSecureBoot = false;
+
+static void securityProbe() {
+  secFlashEnc = esp_flash_encryption_enabled();
+  secSecureBoot = esp_secure_boot_enabled();
+}
+
+// One boot line and one console command ('i'), a few lines at most: what is
+// on, what is off, and the one consequence that matters for the files.
+static void securityInfo(const char* what) {
+  char id[CC_ADDR_SZ * 2 + 1];
+  if (haveIdentity)
+    toHex(myAddr, 4, id);
+  else
+    snprintf(id, sizeof(id), "no id");
+  logMsgf("Sys", DARKGREY, "%s: id %s, sd %s", what, id,
+          sdReady ? "mounted" : "ABSENT");
+  logMsgf("Sys", (secFlashEnc && secSecureBoot) ? GREEN : ORANGE,
+          "flash enc %s, secure boot %s", secFlashEnc ? "on" : "off",
+          secSecureBoot ? "on" : "off");
+  logMsg("Sys", "protects: key.bin counter.bin revoked.bin peers/*", DARKGREY);
+  if (!secFlashEnc || !secSecureBoot)
+    logMsg("Sys",
+            "off: a card reader IS this node; files readable + rollback-able",
+            RED);
+}
 
 // Called from loop(): a confirmation the operator walked away from expires.
 static void consoleTick() {
@@ -2652,48 +2294,13 @@ static void handleConsole() {
       }
       continue;
     }
-    if (conMode == CON_JOIN) {
-      if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
-        joinHex[joinLen] = '\0';
-        joinGroupHex(joinHex, joinLen);
-        conMode = CON_IDLE;
-        joinLen = 0;
-      } else if (joinLen < CC_GROUP_SECRET_SZ * 2) {
-        joinHex[joinLen++] = (char)c;
-        if (joinLen == CC_GROUP_SECRET_SZ * 2) {
-          joinGroupHex(joinHex, joinLen); /* complete: no Enter needed */
-          conMode = CON_IDLE;
-          joinLen = 0;
-        }
-      }
-      continue;
-    }
-    if (conMode == CON_POST) {
-      if (c == '\n' || c == '\r') {
-        conBuf[conLen] = '\0';
-        postGroup(conBuf, conLen);
-        conMode = CON_IDLE;
-        conLen = 0;
-      } else if (conLen < CC_MAX_MSG_SZ) {
-        conBuf[conLen++] = (char)c;
-      }
-      continue;
-    }
     if (c == 'r' || c == 'R')
       publishRotation();
     else if (c == 'x' || c == 'X')
       publishRevocation();
-    else if (c == 'g' || c == 'G')
-      createGroup();
-    else if (c == 'j' || c == 'J') {
-      conMode = CON_JOIN;
-      joinLen = 0;
-    } else if (c == 's' || c == 'S')
-      shareGroup();
-    else if (c == 'p' || c == 'P') {
-      conMode = CON_POST;
-      conLen = 0;
-    } else if (c == 'n' || c == 'N') {
+    else if (c == 'i' || c == 'I')
+      securityInfo("info");
+    else if (c == 'n' || c == 'N') {
       // Deliberate re-identification. Confirmed, because the old identity is
       // not recoverable from this node afterwards.
       conMode = CON_CONFIRM;
@@ -2707,7 +2314,7 @@ static void handleConsole() {
       conMode = CON_CONFIRM;
       conPending = 2;
       conConfirmAt = millis() + CONFIRM_MS;
-      logMsg("Sys", "WIPE: erases key, group secret, peers, state", RED);
+      logMsg("Sys", "WIPE: erases key, counter, revoked, peers", RED);
       logMsg("Sys", "'Y' (capital) confirms, any other key cancels (5 s)", RED);
     }
   }
@@ -2851,20 +2458,6 @@ static void relayForward(const uint8_t* pkt, size_t len) {
     logMsg("TX", "relay chat", DARKGREY);
 }
 
-// A group post is its own broadcast class in the module (its own airtime pool,
-// a per-gid post budget, its own hop cap and its own keyless PoW gate), so it
-// gets its own entry point here -- cc_relay_forward() is the wrong gate for it
-// and stays closed to that type. Every refusal it can return is counted by the
-// module itself (the e_* figures on the stats line), so a refusal is visible
-// rather than silent.
-static void relayGroup(const uint8_t* pkt, size_t len) {
-  size_t olen = 0;
-  int rr = cc_relay_group(&relay, pkt, len, relayNow(), relayBuf,
-                          sizeof(relayBuf), &olen);
-  if (rr == CC_RELAY_FWD && olen > 0 && roadSend(relayBuf, olen))
-    logMsg("TX", "relay group", DARKGREY);
-}
-
 // One compact line: what went out, and why the rest did not.
 static void relayStatsLine() {
   cc_relay_stats_t s;
@@ -2874,13 +2467,12 @@ static void relayStatsLine() {
                    s.e_expired + s.e_noimprove;
   logMsgf("Sys", DARKGREY,
           "relay fwd %lu rx %lu | dup %lu bud %lu unk %lu pow %lu org %lu "
-          "pin %lu repin %lu oth %lu | grp %lu",
+          "pin %lu repin %lu oth %lu",
           (unsigned long)s.forwarded, (unsigned long)s.rx,
           (unsigned long)s.e_dup, (unsigned long)s.e_budget,
           (unsigned long)s.e_unknown, (unsigned long)s.e_pow,
           (unsigned long)s.e_origin, (unsigned long)statRelayOrg,
-          (unsigned long)statRelayRepin, (unsigned long)other,
-          (unsigned long)s.window_group);
+          (unsigned long)statRelayRepin, (unsigned long)other);
 }
 #endif
 
@@ -3121,107 +2713,6 @@ static void processPkt(const uint8_t* pkt, size_t len) {
       oldWireSeen();
     } else {
       statDecrypt++; /* any other failure: counted, not shown */
-    }
-
-  } else if (type == CC_MSG_GROUP_DATA) {
-#if defined(CC_RELAY)
-    // Offered to the relay FIRST and unconditionally: the early returns below
-    // (no group here, another group, a spent budget, a bad post) must never
-    // stop the mesh's traffic being carried, and a relay carries a post for a
-    // group it is not in. This node forwards its OWN group's posts too: a post
-    // is fan-out, not a unicast to us, so members we cannot reach still need it
-    // carried -- the duplicate is dropped downstream by a receiving member's
-    // per-poster window and here by the module's duplicate cache. Same rule as
-    // an announcement, which this app also learns from and re-broadcasts.
-    relayGroup(pkt, len);
-#endif
-    // A group post is BROADCAST: there is no recipient field, so it cannot go
-    // through the recipient-filtered chat branch above. No group joined means
-    // there is nothing to match and no work to do -- the cheapest possible
-    // drop, and it costs an attacker nothing because we spend nothing.
-    if (!group.used)
-      return;
-    // Not for our group (or not a well-formed post): a quiet, cheap drop. The
-    // gid is a plain decode and the gid is on the air in every post, so this
-    // filter is not a secret -- it is here so a post for another group, or a
-    // stranger's garbage, does not spend a slot of the budget that legitimate
-    // posts need.
-    uint8_t pgid[CC_GROUP_GID_SZ];
-    if (cc_group_gid(pkt, len, pgid) != CC_OK ||
-        memcmp(pgid, group.gid, CC_GROUP_GID_SZ) != 0)
-      return;
-    // Budget the verify before it, like every other expensive path: a post
-    // costs a PoW check plus an AEAD attempt, and one that a member captured is
-    // cheap to replay. A refusal is counted and dropped without a display line
-    // (logging each one would hand an attacker the display).
-    if (!groupBudget.allow(GROUP_VERIFY_WINDOW_MS)) {
-      statGroupDrop++;
-      return;
-    }
-    uint8_t poster[CC_ADDR_SZ];
-    if (cc_group_poster(pkt, len, poster) != CC_OK) {
-      statGroupDrop++;
-      return;
-    }
-    // Every packet type pays for admission, and this one is checked with the
-    // build's own group difficulty (a group has no single receiver to publish a
-    // price for, so the sender's own table is the whole price). It is checked
-    // BEFORE the window table is touched, so claiming a slot costs one mined
-    // packet even though the slot itself is only claimed by a post that goes on
-    // to authenticate.
-    if (cc_pow_verify(pkt, len) != CC_OK) {
-      statGroupDrop++;
-      return;
-    }
-    // One replay window per poster LABEL, and a slot is claimed only by a post
-    // that AUTHENTICATES. An UNSEEN label is parsed against a throwaway window
-    // first, so a stranger -- anyone at all, who has merely SEEN one post and
-    // thus knows the gid, which is on the air -- cannot take slots with junk
-    // labels and make this node deaf to the members whose labels it has not
-    // seen yet (a new member's first post, or a member's post after a
-    // rotation). Nothing an outsider sends reaches the table at all.
-    int wi = groupWinFind(poster);
-    bool firstSight = (wi < 0);
-    cc_group_win_t* gwin;
-    if (firstSight) {
-      cc_group_win_init(&groupWinScratch, group.gid, poster);
-      gwin = &groupWinScratch;
-    } else {
-      gwin = &groupWins[wi];
-    }
-    // The AEAD is the authentication: a post that decrypts proves a key holder
-    // sealed it, and the window commits only after the tag verifies. `now` is
-    // this app's millis() clock, which the parse stamps into the window as
-    // `last_seen` -- the ordering groupWinClaim() evicts by.
-    int gr =
-        cc_group_post_parse(&work, &group, gwin, pkt, len, millis(), &groupMsg);
-    if (gr == CC_OK) {
-      if (firstSight) {
-        // A free slot, else the label whose window has gone longest without a
-        // verified post (see GROUP_WIN_MAX: refusing instead would let the
-        // table be filled into permanent deafness). There is no "uncommitted
-        // slot" case to prefer here -- a slot is claimed only by a post that
-        // just committed, so every used slot holds real replay state and the
-        // oldest is the only one whose loss is cheapest.
-        wi = groupWinClaim();
-        groupWins[wi] = *gwin; /* carries the window the parse committed */
-        groupWinUsed[wi] = 1;
-      }
-      char gh[CC_GROUP_GID_SZ * 2 + 1], ph[CC_ADDR_SZ * 2 + 1];
-      char buf[CC_MAX_MSG_SZ + 48];
-      toHex(groupMsg.gid, 4, gh);
-      toHex(groupMsg.poster, 4, ph);
-      // The poster label is what the SEALER claimed, not who it is: any member
-      // can mint another member's label under the shared key.
-      snprintf(buf, sizeof(buf), "[grp %s %s] %.*s", gh, ph,
-               (int)groupMsg.msg_len, (const char*)groupMsg.msg);
-      logMsg("RX", buf, MAGENTA);
-    } else if (gr == CC_E_GROUP || gr == CC_E_ARG) {
-      /* another group's window/label, or a malformed post: quiet drop */
-    } else if (gr == CC_E_REPLAY || gr == CC_E_STALE) {
-      statReplay++;
-    } else {
-      statGroupDrop++; /* a tag that did not verify, or any other failure */
     }
 
   } else if (type == CC_MSG_LINK_REQ) {
@@ -3598,8 +3089,8 @@ void setup() {
   // answered with a fresh keypair: a key file that is PRESENT but does not load
   // is damage, and NO CARD AT ALL is not an empty card (minting on a cardless
   // boot used to be silent re-identification -- peers would see a stranger, the
-  // operator would likely never notice, and the node's links, group membership
-  // and rotation/revocation continuity would be orphaned). In both cases the
+  // operator would likely never notice, and the node's links and its
+  // rotation/revocation continuity would be orphaned). In both cases the
   // node fails closed and says so; 'n' is the deliberate way out.
   int kr = keyLoad();
   if (kr == FILE_ST_NOCARD) {
@@ -3664,9 +3155,11 @@ void setup() {
   // Retirements, so a revoked identity stays revoked across a reboot.
   revokedLoad();
 
-  // The group secret, so a joined group survives a reboot (it is stored in the
-  // clear, like the node key: anyone who reads the card is a member).
-  groupLoad();
+  // What posture this build is running under, in the operator's view: the
+  // platform's flash-encryption and secure-boot fuses, and whether the card is
+  // even there. Reported, never gated on (see securityInfo()).
+  securityProbe();
+  securityInfo("boot");
 
 #if defined(CC_RELAY)
   cc_relay_init(&relay);
@@ -3725,14 +3218,14 @@ void loop() {
             (unsigned long)roadImpl.stats.txFail);
     logMsgf("Sys", DARKGREY,
             "rp %lu sig %lu nokey %lu dec %lu cd %lu ann %lu v %lu "
-            "link %lu/%lu rot %lu rev %lu ctl %lu grp %lu",
+            "link %lu/%lu rot %lu rev %lu ctl %lu",
             (unsigned long)statReplay, (unsigned long)statBadSig,
             (unsigned long)statNoKey, (unsigned long)statDecrypt,
             (unsigned long)statChatDrop, (unsigned long)statAnnDrop,
             (unsigned long)statOldWire,
             (unsigned long)statLinkOpen, (unsigned long)statLinkDrop,
             (unsigned long)statRotated, (unsigned long)statRevoked,
-            (unsigned long)statCtlDrop, (unsigned long)statGroupDrop);
+            (unsigned long)statCtlDrop);
 #if defined(CC_RELAY)
     relayStatsLine();
 #endif
@@ -3740,9 +3233,6 @@ void loop() {
 
   // Persist the outbound counter/seq if either has drifted from the saved copy.
   stateMaybeSave();
-
-  // Same rule for the group's post sequence, which lives in the group file.
-  groupMaybeSave();
 
   delay(5);
 }

@@ -41,14 +41,6 @@ extern "C" {
  * (11 elements -> 12), so it is a wire revision rather than an addition to
  * revision 8: one revision, one wire shape.
  *
- * Groups are a new TYPE inside revision 9, not a new revision: bumping the
- * revision would make every v9 node reject every v10 packet — announces, chats
- * and links included — on a partially upgraded mesh, which is a much worse
- * failure than the one it would fix. A new type is additive. The unavoidable
- * consequence, stated plainly: a v9 receiver drops a group post as an unknown
- * type (CC_E_FORMAT), and a v9 relay will not forward group traffic, so group
- * messages only cross a path where every hop is new.
- *
  * In every revision the envelope stays deterministic CBOR (RFC 8949 4.2), the
  * PoW stays committed to the encoded bytes, and the signature / AEAD AAD stay
  * over the whole envelope minus hops, the nonce and the signature element
@@ -168,21 +160,6 @@ extern "C" {
 #define CC_LINK_PROOF_BUF_SZ (CC_SIGN_SIG_SZ + 96)
 #define CC_LINK_DATA_BUF_SZ (CC_MAX_MSG_SZ + 128)
 #define CC_LINK_IDENTIFY_BUF_SZ (CC_SIGN_SIG_SZ + 128)
-/* Group destinations. The group secret is 32 random bytes and the gid is
-   derived from it, so membership changes never move the group's address. */
-#define CC_GROUP_GID_SZ 8
-#define CC_GROUP_SECRET_SZ 32
-#define CC_GROUP_KEY_SZ 32
-/* A post carries only the message; the gid and the poster label are in the
-   clear, inside both the PoW's and the tag's coverage. */
-#define CC_GROUP_PT_SZ CC_MAX_MSG_SZ
-#define CC_GROUP_ENC0_SZ (CC_GROUP_PT_SZ + 80)
-#define CC_GROUP_BUF_SZ (CC_GROUP_ENC0_SZ + 160)
-/* The provisioning record: the gid and the raw secret, as a small CBOR array
-   inside one link record. */
-#define CC_GROUP_SECREC_PT_SZ (CC_GROUP_GID_SZ + CC_GROUP_SECRET_SZ + 16)
-#define CC_GROUP_SECREC_BUF_SZ (CC_GROUP_SECREC_PT_SZ + 64)
-
 /* A rotation costs one extra address and one extra signature on top of an
    announce; a revocation is an address, two ticks and a signature. */
 #define CC_ROTATE_BUF_SZ (CC_ANN_BUF_SZ + CC_ADDR_SZ + CC_SIGN_SIG_SZ + 32)
@@ -212,7 +189,6 @@ extern "C" {
 #define CC_LINK_KIND_CLOSE 1
 #define CC_LINK_KIND_KEEPALIVE 2
 #define CC_LINK_KIND_IDENTIFY 3
-#define CC_LINK_KIND_GROUP_KEY 4 /* a group key-distribution record */
 
 /*
  * Proof-of-work difficulty, in leading zero bytes of the SHA-256 preimage.
@@ -294,9 +270,6 @@ extern "C" {
 #ifndef CC_POW_DIFFICULTY_REVOKE
 #define CC_POW_DIFFICULTY_REVOKE CC_POW_DIFFICULTY_ANNOUNCE
 #endif
-#ifndef CC_POW_DIFFICULTY_GROUP
-#define CC_POW_DIFFICULTY_GROUP CC_POW_DIFFICULTY
-#endif
 /* Link data/identify/close packets carry no PoW: the handshake prices the
    link, and per-message work is the AEAD alone. Rotation and revocation are
    rare and are priced like an announce, so flooding them costs an attacker
@@ -313,9 +286,7 @@ extern "C" {
 #define CC_MSG_LINK_CLOSE 8
 #define CC_MSG_ROTATE 9  /* new signing key, the old key co-signs continuity */
 #define CC_MSG_REVOKE 10 /* retire my own identity (terminal) */
-#define CC_MSG_GROUP_DATA \
-  11 /* a group post, broadcast; no per-post signature */
-#define CC_MSG_COUNT 12
+#define CC_MSG_COUNT 11
 
 #define CC_OK 0
 #define CC_E_ARG (-1)
@@ -335,8 +306,6 @@ extern "C" {
 #define CC_E_STALE (-10) /* counter older than the replay window: drop */
 #define CC_E_REVOKED \
   (-14) /* this address is retired: drop it, refuse links and rotations */
-#define CC_E_GROUP \
-  (-15) /* not this group: a group post or record for a gid we do not hold */
 #define CC_E_VERSION (-11) /* not CC_WIRE_VERSION: another revision */
 #define CC_E_NOLINK \
   (-12) /* link id unknown, closed, or expired: re-handshake */
@@ -763,14 +732,6 @@ int cc_replay_check(cc_replay_t* st, const uint8_t addr[CC_ADDR_SZ],
  *     "Retire this identity." Signed by the key that hashes to addr, so only
  *     the identity can retire itself; terminal for that address for as long as
  *     the receiver remembers it.
- *
- *   group_data [ver, type=11, hops, gid, poster, seq, nonce, encrypt0]
- *     A group post, broadcast: sealed under a group key, no signature at all.
- *     poster is a self-claimed label, not an identity (see the group section
- *     below), and gid, poster and seq are inside both the PoW's and the tag's
- *     coverage. There is no epoch and no key distribution on this type: the
- *     secret that defines the group is provisioned out of band, or over an
- *     existing link with CC_LINK_KIND_GROUP_KEY.
  *
  * The link record plaintext is [kind, payload_bstr]; kinds are
  * CC_LINK_KIND_DATA / CLOSE / KEEPALIVE / IDENTIFY. The AEAD nonce is
@@ -1287,175 +1248,6 @@ int cc_hops_increment(const uint8_t* in, size_t in_sz, uint8_t* out,
  * cc_pow_verify(pkt, sz) is exactly cc_pow_verify_at(pkt, sz, 0). */
 int cc_pow_verify_at(const uint8_t* pkt, size_t pkt_sz, uint8_t difficulty);
 int cc_pow_verify(const uint8_t* pkt, size_t pkt_sz);
-
-/*
- * ---- Group destinations (a new type inside revision 9) ----
- *
- * A group is a set of members sharing ONE 32-byte secret. There is no
- * membership protocol on the wire, no epochs and no sender keys: the secret is
- * the group and the gid is derived from it. REMOVAL IS A NEW GROUP — a new
- * secret, hence a new gid, which is also an unlinkable identity for the
- * members who remain. That is the only mechanism here that actually excludes a
- * former member: someone who has left still knows the old secret, so anything
- * derived from it remains theirs to derive, and no rotation inside the old
- * secret can lock them out. Say it that way to a user: to remove someone, make
- * a new group and tell the others.
- *
- * KEY SCHEDULE (the labelled Extract/Expand shape the link uses, with labels of
- * its own so a group key can never be confused with a link key):
- *
- *   gid = SHA-256("cosechat/group gid" | secret)[0:8]
- *   prk = Extract(salt = gid, ikm = secret, label = "cosechat/group prk")
- *   key = Expand(prk, label = "cosechat/group key", info = gid)
- *
- * One key per group, held by every member.
- *
- * WHAT A POST PROVES, AND WHAT IT DOES NOT. A post that decrypts proves that
- * someone holding the group key produced it, and — because the tag covers gid,
- * poster and seq — that those fields are the ones its producer sealed. It does
- * NOT prove which member sent it. The poster field is SELF-CLAIMED and
- * NON-BINDING: every member holds the same key and can seal any label, so no
- * policy may depend on poster. It exists so that members can partition their
- * own sequence spaces and a receiver can keep one replay window per label.
- * The residual, stated because it is real: a member can silence another member
- * by minting a high sequence under that member's label. Only per-post
- * signatures change that, and they are deliberately out of scope — a per-post
- * ML-DSA signature over the routing fields (the chat pattern) would give
- * non-repudiation at roughly +3.3 KB per post, about 14 fragments, so the price
- * is known if a deployment decides it needs it.
- *
- * NONCES: the PoW nonce is its own field, and the AEAD uses a random 96-bit IV
- * carried inside the COSE structure rather than the link's direction|salt|
- * sequence construction. That is not an anti-attacker measure: one group key
- * carries one counter space PER MEMBER, so two honest members both at seq 1
- * would collide systematically under a deterministic nonce — a guaranteed GCM
- * reuse, not an unlucky one. A malicious member can force a collision anyway by
- * reusing an IV it read off the wire, and it gains nothing: a key holder can
- * already decrypt every post and seal any label. The sequence stays in the AAD,
- * so replay and ordering are unaffected, and never repeating a seq for a label
- * is the caller's duty.
- *
- * REPLAY is the parse entry point's job, with the same discipline cc_chat_parse
- * uses: it PEEKS the per-(gid, poster) sequence window before the AEAD and
- * COMMITS it only after the tag verifies, so a post that fails the tag cannot
- * move any window. (cc_replay_check cannot be used for this: it is pinned to
- * the unsigned class and commits immediately, which would let a post with a
- * forged poster label move a victim's window.) The window is caller-owned like
- * every other piece of state, and the composite is explicit: cc_group_win_t
- * carries the gid and the poster alongside the cc_replay_t, so a caller cannot
- * key a window by address alone and blend two groups into one sequence space.
- *
- * PROVISIONING is out of band: the secret is exported and imported as raw bytes
- * (cc_group_secret_export / cc_group_join) — an operator types it in, scans it,
- * or the app arranges something else. Sending it over an EXISTING link is
- * offered as a convenience (cc_group_secret_send / _recv, one link record of
- * kind CC_LINK_KIND_GROUP_KEY), but a link is NOT required: out-of-band
- * provisioning is what makes groups work on a mesh where members are not
- * adjacent to each other. There is no unauthenticated distribution path, by
- * design — whoever receives the secret is the group.
- *
- * STATE, measured: cc_group_t is 41 bytes (32 secret + 8 gid + a used flag),
- * cc_group_win_t is 64 bytes (8 gid + 16 poster + 32 replay + 4 last-seen,
- * padded to the replay window's 8-byte alignment) and a decrypted post is 552
- * bytes (the message buffer dominates). A member of an 8-member group therefore
- * keeps 41 + 7 * 64 = 489 bytes, plus one window per poster label it wants to
- * police, which cc_group_win_stale helps it bound.
- *
- * RELAYING, for whoever owns that: a group post is a broadcast class of its
- * own and needs its own airtime pool, a per-gid budget and its own hop cap.
- * Every relay re-prices at its own floor, so the price a sender effectively
- * pays is the strictest relay on the path, not its own. A revision-9 relay that
- * does not know this type drops it (CC_E_FORMAT) and does not forward it.
- */
-
-/*
- * cc_group_t is the state a member keeps for one group: the secret — a secret,
- * wiped by cc_group_free — and the gid derived from it. There is nothing else
- * to keep: no epoch, no keys beyond those the KDF produces on demand.
- */
-typedef struct {
-  uint8_t secret[CC_GROUP_SECRET_SZ];
-  uint8_t gid[CC_GROUP_GID_SZ];
-  uint8_t used;
-} cc_group_t;
-
-/*
- * cc_group_win_t is the replay state for one poster label within one group.
- * The gid and the poster are IN the struct on purpose: the composite is the
- * key, not something the caller is trusted to remember.
- */
-typedef struct {
-  uint8_t gid[CC_GROUP_GID_SZ];
-  uint8_t poster[CC_ADDR_SZ];
-  cc_replay_t seq;
-  uint32_t last_seen; /* tick of the last VERIFIED post; 0 if none yet */
-} cc_group_win_t;
-
-/* A decrypted post. poster is what the sealer claimed, not who they are. */
-typedef struct {
-  uint8_t poster[CC_ADDR_SZ];
-  uint8_t gid[CC_GROUP_GID_SZ];
-  uint8_t msg[CC_GROUP_PT_SZ];
-  size_t msg_len;
-  uint32_t seq;
-  uint8_t hops;
-} cc_group_msg_t;
-
-/* A new group: a random secret and the gid derived from it. */
-int cc_group_create(cc_group_t* g, WC_RNG* rng);
-/* Export the raw secret for out-of-band delivery, and import it to join. */
-int cc_group_secret_export(const cc_group_t* g,
-                           uint8_t out[CC_GROUP_SECRET_SZ]);
-int cc_group_join(cc_group_t* g, const uint8_t secret[CC_GROUP_SECRET_SZ]);
-/* Wipe the secret and the gid. */
-int cc_group_free(cc_group_t* g);
-
-/* Convenience provisioning over an existing link: send the secret as a link
-   record, and join from one received that way. A link is not required to be in
-   a group; this is for members that happen to have one. */
-int cc_group_secret_send(cc_work_t* w, const cc_group_t* g, cc_link_t* l,
-                         uint32_t now, uint8_t* out, size_t out_sz,
-                         size_t* out_len);
-int cc_group_secret_recv(cc_work_t* w, cc_group_t* g, const cc_link_t* l,
-                         const uint8_t* payload, size_t payload_len);
-
-/* Build a post: sealed under the group key, carrying `poster` as a label (see
-   the header note: self-claimed, no policy may depend on it). seq is the
-   caller's monotonic counter for that label, and it must never repeat — the
-   AEAD nonce is randomised per post, so a repeated sequence is a replay, not a
-   nonce reuse. */
-int cc_group_post_build(cc_work_t* w, const cc_group_t* g,
-                        const uint8_t poster[CC_ADDR_SZ], uint32_t seq,
-                        const uint8_t* msg, size_t msg_len, uint8_t* out,
-                        size_t out_sz, size_t* out_len, WC_RNG* rng);
-/* Accept a post against the window for the poster label it claims. Read the
-   label first (cc_group_poster(), a cheap decode like cc_chat_sender()) and
-   hand over that label's window: the parse checks the group, peeks the window,
-   decrypts, commits the window only on success. A post for another group is
-   CC_E_GROUP, one the tag rejects is CC_E_DECRYPT, a replay or an old counter
-   is CC_E_REPLAY / CC_E_STALE. */
-int cc_group_post_parse(cc_work_t* w, const cc_group_t* g, cc_group_win_t* win,
-                        const uint8_t* in, size_t in_sz, uint32_t now,
-                        cc_group_msg_t* out);
-
-/* The per-label window: init (binds gid and poster), wipe, and the eviction
-   predicate for a caller whose table is under pressure. cc_group_post_parse
-   stamps last_seen when a post verifies, so a caller can drop windows that
-   have not carried a verified post for `horizon` ticks — a window that never
-   did (last_seen 0) is the first to go, which is exactly the label flood. The
-   cost is honest: once a window is gone, that label's replay protection is
-   gone with it, so evict on a horizon you are willing to lose traffic to. */
-int cc_group_win_init(cc_group_win_t* win, const uint8_t gid[CC_GROUP_GID_SZ],
-                      const uint8_t poster[CC_ADDR_SZ]);
-int cc_group_win_forget(cc_group_win_t* win);
-int cc_group_win_stale(const cc_group_win_t* win, uint32_t now,
-                       uint32_t horizon);
-
-/* Cheap accessors, no crypto and no context, like cc_chat_sender(). */
-int cc_group_poster(const uint8_t* pkt, size_t pkt_sz,
-                    uint8_t addr[CC_ADDR_SZ]);
-int cc_group_gid(const uint8_t* pkt, size_t pkt_sz,
-                 uint8_t gid[CC_GROUP_GID_SZ]);
 
 #ifdef __cplusplus
 }

@@ -25,8 +25,6 @@ _Static_assert(CC_RELAY_WINDOW >= 1, "a non-zero budget window");
 _Static_assert(CC_RELAY_FWD_BUDGET >= 1, "a per-destination budget");
 _Static_assert(CC_RELAY_AIRTIME_ANNOUNCE >= 1, "an announce airtime budget");
 _Static_assert(CC_RELAY_AIRTIME_DATA >= 1, "a data airtime budget");
-_Static_assert(CC_RELAY_AIRTIME_GROUP >= 1, "a group airtime budget");
-_Static_assert(CC_RELAY_GIDS >= 1, "at least one group budget slot");
 
 /* The hops element's position in every layout (include/cosechat.h). The relay
  * needs it for one thing only: the duplicate digest leaves hops out, because
@@ -161,12 +159,11 @@ static void path_learn(cc_relay_path_t* e, const uint8_t addr[CC_ADDR_SZ],
     memcpy(e->admit, admit, CC_ADMIT_SZ);
 }
 
-/* The three kinds of traffic a relay carries, each with its own pool. */
+/* The two kinds of traffic a relay carries, each with its own pool. */
 #define RELAY_CLS_ANNOUNCE 0
 #define RELAY_CLS_DATA 1
-#define RELAY_CLS_GROUP 2
 
-/* ---- per-destination and per-group budget tables ---- */
+/* ---- the per-destination budget table ---- */
 
 /*
  * The counter for `addr`, claimed if this address has none yet. Slots are
@@ -209,51 +206,13 @@ static cc_relay_budget_t* budget_slot(cc_relay_t* r,
   return free_slot;
 }
 
-/* The counter for `gid`, claimed if this group has none yet: free slot, then a
- * dead window, then the oldest, then the least used — the same policy as the
- * destination table, over an 8-byte key. */
-static cc_relay_gid_t* gid_slot(cc_relay_t* r,
-                                const uint8_t gid[CC_GROUP_GID_SZ]) {
-  cc_relay_gid_t* free_slot = NULL;
-  cc_relay_gid_t* dead_slot = NULL;
-  cc_relay_gid_t* oldest = NULL;
-  int i;
-
-  for (i = 0; i < CC_RELAY_GIDS; i++) {
-    cc_relay_gid_t* g = &r->gids[i];
-    if (g->used && memcmp(g->gid, gid, CC_GROUP_GID_SZ) == 0)
-      return g;
-    if (!g->used) {
-      if (!free_slot)
-        free_slot = g;
-      continue;
-    }
-    if (g->window != r->window) {
-      if (!dead_slot)
-        dead_slot = g;
-      continue;
-    }
-    if (!oldest || (int32_t)(g->window - oldest->window) < 0 ||
-        (g->window == oldest->window && g->count < oldest->count))
-      oldest = g;
-  }
-  if (!free_slot)
-    free_slot = dead_slot ? dead_slot : oldest;
-  memset(free_slot, 0, sizeof(*free_slot));
-  memcpy(free_slot->gid, gid, CC_GROUP_GID_SZ);
-  free_slot->used = 1;
-  free_slot->window = r->window;
-  return free_slot;
-}
-
 /*
  * Charge a forward against the window that matches its kind, rolling the window
- * over first. Each kind has its own pool, because one pool lets the bulk or the
- * loudest class starve the others: announcements are bulk and rare, group posts
- * are broadcasts that fan out, and data is what a relay exists for. Data also
- * has a per-destination packet budget and posts a per-group one, so one peer or
- * one group cannot take a whole pool. Returns 0 when something is spent (and
- * changes nothing else).
+ * over first. Each kind has its own pool, because one pool lets the bulk class
+ * starve the other: announcements are bulk and rare, and data is what a relay
+ * exists for. Data also has a per-destination packet budget, so one peer cannot
+ * take the whole data pool. Returns 0 when something is spent (and changes
+ * nothing else).
  */
 static int budget_take(cc_relay_t* r, const uint8_t* key, uint32_t now,
                        size_t bytes, int cls) {
@@ -263,28 +222,12 @@ static int budget_take(cc_relay_t* r, const uint8_t* key, uint32_t now,
     r->window = now;
     r->airtime_announce = 0;
     r->airtime_data = 0;
-    r->airtime_group = 0;
   }
 
   if (cls == RELAY_CLS_ANNOUNCE) {
     if (r->airtime_announce + bytes > CC_RELAY_AIRTIME_ANNOUNCE)
       return 0;
     r->airtime_announce += (uint32_t)bytes;
-    return 1;
-  }
-
-  if (cls == RELAY_CLS_GROUP) {
-    cc_relay_gid_t* g = gid_slot(r, key);
-    if (g->window != r->window) {
-      g->window = r->window;
-      g->count = 0;
-    }
-    if (g->count >= CC_RELAY_GROUP_BUDGET)
-      return 0;
-    if (r->airtime_group + bytes > CC_RELAY_AIRTIME_GROUP)
-      return 0;
-    g->count++;
-    r->airtime_group += (uint32_t)bytes;
     return 1;
   }
 
@@ -496,8 +439,8 @@ static int relay_restamp(const uint8_t* pkt, size_t pkt_sz, uint8_t* out,
 /*
  * Charge the window, remember the packet as re-broadcast, and hand it back.
  * `n` is what the medium pays (the outgoing length); `key` is the destination
- * (16 bytes) or the gid (8 bytes) that pays in the packet counter, or NULL for
- * an announcement, which is broadcast and has none; `cls` picks the pool.
+ * (16 bytes) that pays in the packet counter, or NULL for an announcement,
+ * which is broadcast and has none; `cls` picks the pool.
  */
 static int relay_commit(cc_relay_t* r, const uint8_t* key, const uint8_t* pkt,
                         size_t pkt_sz, size_t n, uint32_t now, int cls,
@@ -737,62 +680,6 @@ int cc_relay_forward(cc_relay_t* r, const uint8_t* pkt, size_t pkt_sz,
   return relay_commit(r, e->addr, pkt, pkt_sz, n, now, RELAY_CLS_DATA, out_len);
 }
 
-int cc_relay_group(cc_relay_t* r, const uint8_t* pkt, size_t pkt_sz,
-                   uint32_t now, uint8_t* out, size_t out_sz, size_t* out_len) {
-  uint8_t gid[CC_GROUP_GID_SZ], type = 0, hops = 0;
-  size_t n = 0;
-  int ret;
-
-  if (!r)
-    return CC_RELAY_E_ARG;
-  if (!pkt || !out || !out_len || out == pkt)
-    return relay_fail(r, CC_RELAY_E_ARG);
-  *out_len = 0;
-  r->stats.rx++;
-
-  ret = cc_msg_type(pkt, pkt_sz, &type);
-  if (ret != CC_OK)
-    return relay_fail_decode(r, ret);
-  if (type != CC_MSG_GROUP_DATA)
-    return relay_fail(r, CC_RELAY_E_TYPE);
-
-  /* cc_group_gid fully decodes the envelope, so this is also the structural
-   * check: a malformed or truncated post is refused before any state moves. */
-  ret = cc_group_gid(pkt, pkt_sz, gid);
-  if (ret != CC_OK)
-    return relay_fail_decode(r, ret);
-  ret = cc_msg_hops(pkt, pkt_sz, &hops);
-  if (ret != CC_OK)
-    return relay_fail_decode(r, ret);
-
-  if (hops >= CC_RELAY_MAX_HOPS_GROUP)
-    return relay_fail(r, CC_RELAY_E_MAXHOPS);
-
-  /* A broadcast has no destination to read a declared price from, so the price
-   * is this build's own floor for the type. */
-#if CC_RELAY_REQUIRE_POW
-  ret = cc_pow_verify_at(pkt, pkt_sz, 0);
-  if (ret != CC_OK) {
-    if (ret == CC_E_POW)
-      return relay_fail(r, CC_RELAY_E_POW);
-    return (ret == CC_E_VERSION) ? relay_fail(r, CC_RELAY_E_VERSION)
-                                 : relay_fail(r, CC_RELAY_E_FORMAT);
-  }
-#endif
-
-  if (dup_find(r, pkt, pkt_sz, now))
-    return relay_fail(r, CC_RELAY_E_DUP);
-
-  if (out_sz < pkt_sz + 1)
-    return relay_fail(r, CC_RELAY_E_BUF);
-
-  ret = relay_restamp(pkt, pkt_sz, out, out_sz, &n);
-  if (ret != CC_RELAY_FWD)
-    return relay_fail(r, ret);
-
-  return relay_commit(r, gid, pkt, pkt_sz, n, now, RELAY_CLS_GROUP, out_len);
-}
-
 int cc_relay_path_lookup(const cc_relay_t* r, const uint8_t addr[CC_ADDR_SZ],
                          uint32_t now, cc_relay_path_t* out) {
   int i;
@@ -845,31 +732,12 @@ int cc_relay_budget_get(const cc_relay_t* r, const uint8_t addr[CC_ADDR_SZ],
   return CC_RELAY_E_UNKNOWN;
 }
 
-int cc_relay_gid_get(const cc_relay_t* r, const uint8_t gid[CC_GROUP_GID_SZ],
-                     uint32_t now, cc_relay_gid_t* out) {
-  int i;
-  if (!r || !gid || !out)
-    return CC_RELAY_E_ARG;
-  for (i = 0; i < CC_RELAY_GIDS; i++) {
-    const cc_relay_gid_t* g = &r->gids[i];
-    if (g->used && memcmp(g->gid, gid, CC_GROUP_GID_SZ) == 0) {
-      *out = *g;
-      if (out->window != r->window ||
-          (uint32_t)(now - r->window) >= CC_RELAY_WINDOW)
-        out->count = 0;
-      return CC_OK;
-    }
-  }
-  return CC_RELAY_E_UNKNOWN;
-}
-
 int cc_relay_stats(const cc_relay_t* r, cc_relay_stats_t* out) {
   if (!r || !out)
     return CC_RELAY_E_ARG;
   *out = r->stats;
   out->window_announce = r->airtime_announce;
   out->window_data = r->airtime_data;
-  out->window_group = r->airtime_group;
   return CC_OK;
 }
 

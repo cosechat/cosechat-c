@@ -18,7 +18,7 @@ This is library version 0.10.0, wire revision 9.
 - **Announces** — self-signed with raw ML-DSA over the canonical byte string, carrying name + KEM public key + a CBOR metadata map + a signed `admit` declaration, plus a signed monotonic `seq` and an absolute `expiry`; `cc_announce_fresh` is the dedup / anti-replay / freshness rule.
 - **Chat (opportunistic)** — one-shot and addressed: ML-KEM encapsulation + AES-256-GCM with the payload in a COSE_Encrypt0 (RFC 9052 §5.2) structure, signed by the sender's raw ML-DSA key, with the receiver verifying that signature against the sender's *announced* key before any decapsulation, so an unknown sender is refused outright (`CC_E_NOKEY`).
 - **Links (sessions)** — a handshake (LINK_REQ/LINK_PROOF) derives per-direction keys with forward secrecy, then a message is one small AEAD record named by `link_id` alone: no per-message signature, no per-message PoW, and neither address on the wire.
-- **Groups** — a shared-secret broadcast: members hold one 32-byte secret, derive one key from it, and post to the group under a `gid` (the first 8 bytes of a hash of that secret). A post proves *a key holder* produced it, not which one (see [Group messaging](#group-messaging)).
+- **Group/multicast destinations are out of scope** — a shared-secret group cannot exclude a member, and excluding one needs per-member key distribution or a protocol like MLS, neither of which fits this medium.
 - **Identity continuity** — ROTATE (9) moves an identity to a new signing key with the old key co-signing the move, and REVOKE (10) retires an address permanently; both are caller-driven, and the caller decides how long it remembers a revocation.
 - **Replay protection** — a caller-owned, caller-persisted 32-byte sliding window (`cc_replay_t`) per peer and per traffic class; authenticated chat and unsigned presence/`key_req` never share a window. A link carries a 64-slot sequence window inside `cc_link_t`, and `cc_replay_move` carries a window across a rotation.
 - **Admission pricing** — SHA-256 proof-of-work on the handshake and the directed packets, priced per packet type, plus an `admit` field in the announce where a node *declares* the price it asks of senders for chat, `link_req` and `key_req`. A receiver always enforces its own configured difficulty; the declaration only tells senders what to aim at.
@@ -44,9 +44,8 @@ This is library version 0.10.0, wire revision 9.
 | `CC_MSG_LINK_CLOSE` | 8 | Link teardown record (same packet shape as `LINK_DATA`) |
 | `CC_MSG_ROTATE` | 9 | Move the identity to a new signing key, old key co-signs |
 | `CC_MSG_REVOKE` | 10 | Retire this identity (terminal for the address) |
-| `CC_MSG_GROUP_DATA` | 11 | Group post, broadcast (payload COSE_Encrypt0 under the group key) |
 
-`CC_MSG_COUNT` is 12.
+`CC_MSG_COUNT` is 11.
 
 The three link record packet types share one shape, and the *authenticated*
 record kind — not the packet type — decides what a record means, so a receiver
@@ -87,10 +86,8 @@ rotate   [ver, type=9, hops, nonce, new_sign_pub, new_kem_pub, name, meta,
           prev_addr, seq, expiry, new_sig, cont_sig]
 revoke   [ver, type=10, hops, nonce, addr, seq, expiry, sig]
 
-group_data [ver, type=11, hops, gid, poster, seq, nonce, encrypt0]
-
   link record plaintext: [kind, payload_bstr]
-    kind = CC_LINK_KIND_DATA / CLOSE / KEEPALIVE / IDENTIFY / GROUP_KEY
+    kind = CC_LINK_KIND_DATA / CLOSE / KEEPALIVE / IDENTIFY
 ```
 
 - **announce** is self-signed: the packet carries the signing key whose
@@ -124,13 +121,11 @@ over the whole record, with `hops` still outside it.
 ```
 PoW       SHA-256(packet bytes with the hops and nonce elements removed ‖ nonce_le32)
             must have CC_POW_DIFFICULTY_<TYPE> leading zero bytes
-            (announce, chat, presence, key_req, link_req, link_proof, rotate, revoke,
-            group_data)
+            (announce, chat, presence, key_req, link_req, link_proof, rotate, revoke)
 Signature announce, chat, rotate: over the packet bytes without the nonce trailer
             and without the signature elements themselves; link_proof signs the
             handshake transcript instead
-AEAD AAD  chat and group_data: everything except hops, the nonce and the ciphertext
-            (chat also excludes its signature element)
+AEAD AAD  chat: everything except hops, the nonce, the ciphertext and the signature
 ```
 
 `hops` is the only mutable element: it is covered by nothing — not the PoW, not
@@ -261,9 +256,9 @@ the announce.
 
 Default build (ML-DSA-65 + ML-KEM-768, difficulty 2, short names), from
 `examples/announce.c`, `examples/chat.c` and a host build of
-`cc_rotate_build()`/`cc_revoke_build()`/`cc_group_post_build()`; a LoRa fragment
-carries 248 bytes, a BLE advertisement 243. The mined nonce is a
-minimally-encoded uint, so a packet can shift by a byte or two between runs.
+`cc_rotate_build()`/`cc_revoke_build()`; a LoRa fragment carries 248 bytes, a
+BLE advertisement 243. The mined nonce is a minimally-encoded uint, so a packet
+can shift by a byte or two between runs.
 
 | Packet | Bytes | LoRa fragments |
 |--------|-------|----------------|
@@ -274,20 +269,15 @@ minimally-encoded uint, so a packet can shift by a byte or two between runs.
 | revoke | 3338 | 14 |
 | link_proof | 3331 | 14 |
 | link_req | 1108 | 5 |
-| group post (max message) | 589 | 3 |
-| group post (tiny message) | 76 | 1 |
-| group key record (link) | 80 | 1 |
 | link_data | 45 | 1 |
 | presence | 34 | 1 |
 | key_req | 25 | 1 |
 
-A group post carries no per-post signature, so it costs a fragment or three
-where the opportunistic chat of the same message size costs nineteen, and the
-key-distribution record is one link record of 80 bytes. One link handshake is 19
-fragments once (link_req + link_proof), and then every message is a
-1-fragment link_data record; the opportunistic chat is 19 fragments for every
-message. Linking therefore pays for itself at the second message — after the
-first, one handshake plus *n* one-fragment messages beats *n* signed messages.
+One link handshake is 19 fragments once (link_req + link_proof), and then every
+message is a 1-fragment link_data record; the opportunistic chat is 19
+fragments for every message. Linking therefore pays for itself at the second
+message — after the first, one handshake plus *n* one-fragment messages beats
+*n* signed messages.
 
 ## Links (sessions)
 
@@ -324,80 +314,6 @@ so the byte is provisional; a handshake whose suite byte differs is
 `cc_key_t`). `cc_link_recv()` answers `CC_E_NOLINK` for an unknown, closed or
 idle-expired link so the peer re-handshakes, and `CC_E_REPLAY` / `CC_E_STALE`
 from the sequence window.
-
-## Group messaging
-
-A group is a set of members who share one 32-byte secret. There is no membership
-protocol on the wire, no epochs and no sender keys: the secret **is** the group,
-and its `gid` is `SHA-256("cosechat/group gid" | secret)[0:8]`. One key per
-group is derived from the secret with the same labelled `Extract`/`Expand` shape
-the link uses but labels of its own (`"cosechat/group prk"`, then
-`"cosechat/group key"`), so a group key can never be confused with a link key.
-
-A post (`CC_MSG_GROUP_DATA`, type 11) is a broadcast: `gid`, the poster label,
-the sequence and a COSE_Encrypt0 (RFC 9052 §5.2) blob sealed under the group key
-with a random per-post IV. The AEAD tag and the PoW both cover `gid`, `poster`
-and `seq`, so those are the values the producer actually sealed. There is no
-per-post signature. Replay is per `(gid, poster)`: `cc_group_post_parse()`
-peeks that label's window before the AEAD and commits it only once the tag
-verifies, so a post that fails the tag cannot move anyone's window (a
-`cc_group_win_t` carries the `gid` and the poster with the `cc_replay_t`, so a
-caller cannot key a window by address alone and blend two groups into one
-sequence space).
-
-### What a post proves
-
-Bluntly: a post that decrypts proves that **someone holding the group key**
-produced it, and that `gid`, `poster` and `seq` are the values its producer
-sealed. It does **not** prove which member sent it. The `poster` field is a
-self-claimed, non-binding label: every member holds the same key and can seal
-any other member's label, and because the window is per label, a member can
-silence another member's label by minting a high sequence under it. No policy
-may depend on the poster label — it exists only so members can partition their
-own sequence spaces and a receiver can keep one window per label. Attribution
-would need a per-post ML-DSA signature over the routing fields (the chat
-pattern, ~+3.3 KB per post, about 14 fragments) and is deliberately not
-implemented.
-
-### Membership and removal
-
-Membership is "who knows the secret". There is no cryptographic removal:
-someone who has left still knows the old secret, so everything derived from it
-remains theirs to derive. The way to remove a member is to **create a new
-group** — a new secret, hence a new and unlinkable `gid` — and provision the
-remaining members. And a group has no forward secrecy *within* itself: whoever
-holds the secret can read every post for as long as the group exists, and a
-compromised member reads and can forge posts. Replacing the group is the only
-remedy, which is also why the address never moves for a membership change (the
-`gid` follows the secret, not the roster).
-
-### Provisioning
-
-The secret is exported and imported as 32 raw bytes
-(`cc_group_secret_export()` / `cc_group_join()`), and provisioning is out of
-band by design: the operator types it in, scans it, or the app arranges
-something else — that is the path that works when members are not adjacent.
-Sending it over an existing authenticated link is offered as a convenience
-(`cc_group_secret_send()` / `cc_group_secret_recv()`, one link record of kind
-`CC_LINK_KIND_GROUP_KEY`), but a link is not required. There is no
-unauthenticated distribution path: whoever receives the secret is the group.
-The library holds no group directory — `cc_group_t` is 41 bytes of caller-owned
-state (the secret, wiped by `cc_group_free()`, plus the derived `gid`) — so the
-app persists the exported secret wherever it keeps key material, and whoever can
-read that store is a member.
-
-### Wire revision
-
-The library version is 0.10.0 but the wire revision stays **9**: a new type
-changes no existing shape, and bumping the revision would make every older node
-reject *every* packet — announces, chats and links included — on a partially
-upgraded mesh, which is a far worse failure than the one it would fix. The
-consequence is honest and unavoidable: a revision-9 receiver that predates
-groups drops a post as an unknown type (`CC_E_FORMAT`), and a revision-9 relay
-will not forward group traffic, so a group message only crosses a path where
-every hop understands it. A relay that does carry the type forwards posts
-through its own entry point (`cc_relay_group()`) with a group airtime pool, a
-per-`gid` budget and its own hop cap — see [Relay (multi-hop)](#relay-multi-hop).
 
 ## Relay (multi-hop)
 
@@ -450,58 +366,45 @@ the library.
   pressure: the cache evicts its oldest digest when full, so under heavy
   traffic the effective window is shorter than the TTL — size `CC_RELAY_DUP` to
   the packet rate you want to cover.
-- **Budgets: three airtime pools, a per-destination data budget and a per-group
-  post budget.** All are per `CC_RELAY_WINDOW` ticks (60 by default), all refuse
-  with `CC_RELAY_E_BUDGET`, and all recover on the next window.
-  `CC_RELAY_AIRTIME_ANNOUNCE` (16384 B), `CC_RELAY_AIRTIME_DATA` (16384 B) and
-  `CC_RELAY_AIRTIME_GROUP` (8192 B) are separate pools because one pool makes
-  bulk traffic starve the traffic a relay exists for: an announce is ~6.5 KB, so
-  a single channel-sized pool would admit an announce *or* some data, and one
+- **Budgets: two airtime pools plus a per-destination data budget.** All are per
+  `CC_RELAY_WINDOW` ticks (60 by default), all refuse with `CC_RELAY_E_BUDGET`,
+  and all recover on the next window. `CC_RELAY_AIRTIME_ANNOUNCE` (16384 B) and
+  `CC_RELAY_AIRTIME_DATA` (24576 B) are separate pools, one per class, because a
+  shared pool lets one class starve the other: an announce is ~6.5 KB, so a
+  single channel-sized pool would admit an announce *or* some data, and one
   announce from anyone would black out relayed data mesh-wide for the window.
   `CC_RELAY_FWD_BUDGET` is 3 *data* packets per destination per window —
   fairness, so one destination cannot take the data pool, and enough for two
-  messages out and one back through this relay in a minute; the byte pool is
-  the real bound (three ~4.5 KB chats are well under it). `CC_RELAY_GROUP_BUDGET`
-  is 2 posts per `gid` per window, the broadcast analogue: a post is one packet
-  that serves the whole group, so two is generous for a feed. Per-destination
-  counters live in their own table keyed by address and per-group counters in
-  one keyed by `gid`, so losing a route to table pressure does not hand that
-  destination or group a fresh budget.
-- **Group posts have their own forwarding path.** A post has no recipient, so
-  `cc_relay_forward()` stays closed to it and `cc_relay_group()` is its own
-  entry point with its own limits: its own hop cap
-  (`CC_RELAY_MAX_HOPS_GROUP`, defaulting to `CC_RELAY_MAX_HOPS`, so broadcast
-  reach can be raised without loosening what a conversation costs), the group
-  airtime pool, and the per-`gid` budget. The keyless PoW gate runs first here
-  too, but a broadcast has no destination to declare a price, so a post is
-  charged this build's `CC_POW_DIFFICULTY_GROUP` rather than a peer's `admit`
-  byte. `cc_relay_gid_get()` reports what a group has spent.
+  messages out and one back through this relay in a minute. The pool is the real
+  bound and is reached long before the counters are: sixteen peers all at their
+  budget would want ~216 KB, and the data pool is under 25 KB. Per-destination
+  counters live in their own table keyed by address, so losing a route to table
+  pressure does not hand that destination a fresh budget.
 - **Every relay re-prices.** The price a sender effectively pays is the
   strictest relay on its path, not its own: each relay checks the packet
   against the destination's declared price or its own floor, and nothing carries
   a receipt for work already done.
-- **Sizing.** The three pools model one SF7 / 125 kHz LoRa channel: 16384 B is
-  ~2.5 announces, 16384 B ~3.6 chats and 8192 B ~10 group posts per window,
-  ~683 B/s together — inside that channel's payload rate (preamble and framing
-  included) and leaving the rest of the channel to the node's own traffic. A
-  WiFi or Ethernet road raises all three pools, `CC_RELAY_FWD_BUDGET`,
-  `CC_RELAY_GROUP_BUDGET`, `CC_RELAY_BUDGETS` and `CC_RELAY_GIDS` together.
+- **Sizing.** One SF7 / 125 kHz LoRa channel carries ~683 B/s of payload
+  (preamble and framing included), so a 60-tick window is ~40960 B, and the
+  split is one channel's worth in total: 16384 B to announcements (~2.5 of
+  them) and 24576 B to data (~5.4 chats of ~4.5 KB). The split, not the total,
+  is what keeps announcements from silencing data and data from silencing
+  announcements; a WiFi or Ethernet road raises both pools by orders of
+  magnitude, and `CC_RELAY_BUDGETS` with them.
 - **Keyless PoW gate first.** With `CC_RELAY_REQUIRE_POW` (the default) a chat
   must pay the price the destination's own announcement declares (its signed
   `admit` byte for chat), with this build's `CC_POW_DIFFICULTY_CHAT` as a
-  floor, and a group post must pay this build's `CC_POW_DIFFICULTY_GROUP` —
-  both checked with `cc_pow_verify_at()` before a cache slot or any budget is
+  floor, checked with `cc_pow_verify_at()` before a cache slot or any budget is
   spent (`CC_RELAY_E_POW`). The check needs no keys, and without it hand-crafted
   unmined envelopes would burn a destination's window for free.
 - **Default state.** `CC_RELAY_PATHS` 64 → 3 KiB (48 B each), `CC_RELAY_DUP`
-  32 → 640 B (20 B each), `CC_RELAY_BUDGETS` 16 → 384 B (24 B each),
-  `CC_RELAY_GIDS` 16 → 256 B (16 B each), plus the window, the three pool
-  counters and the stats: `cc_relay_t` is 4460 bytes at the defaults, and every
-  byte follows from those compile-time knobs. A consumer that lowers the
-  capacities gets a smaller struct — the reference firmware's relay env sets
-  `CC_RELAY_PATHS=16`, `CC_RELAY_DUP=16` and `CC_RELAY_BUDGETS=8`, which is
-  1644 bytes. `CC_RELAY_MAX_HOPS` is 8 (and `CC_RELAY_MAX_HOPS_GROUP` defaults
-  to it), `CC_RELAY_PATH_TTL` 600 ticks, `CC_RELAY_DUP_TTL` 300 ticks.
+  32 → 640 B (20 B each), `CC_RELAY_BUDGETS` 16 → 384 B (24 B each), plus the
+  window, the two pool counters and the stats: `cc_relay_t` is 4196 bytes at the
+  defaults, and every byte follows from those compile-time knobs. A consumer
+  that lowers the capacities gets a smaller struct — the reference firmware's
+  relay env sets `CC_RELAY_PATHS=16`, `CC_RELAY_DUP=16` and
+  `CC_RELAY_BUDGETS=8`, which is 1380 bytes. `CC_RELAY_MAX_HOPS` is 8,
+  `CC_RELAY_PATH_TTL` 600 ticks, `CC_RELAY_DUP_TTL` 300 ticks.
 - **Refusals are countable and inert.** Every drop has its own `CC_RELAY_E_*`
   code and its own counter in `cc_relay_stats_t`; a refusal never modifies the
   packet, the table or the cache, and sets `*out_len` to 0 so a stale buffer
@@ -546,23 +449,19 @@ structure; the envelope itself is this protocol's own over deterministic CBOR.
 - **Algorithm identifiers (COSE)** — ML-DSA-65 is `-49`
   (`draft-ietf-cose-dilithium-11`, in AUTH48 as RFC 9964), AES-256-GCM is `3`
   and HKDF-SHA-256 is `5` (RFC 9053).
-- **COSE_Encrypt0** — the opportunistic chat's payload and a group post are
-  COSE_Encrypt0 structures (RFC 9052 §5.2), whose AEAD `external_aad` binds the
-  envelope fields around them (for a post, `gid`, `poster` and `seq`). They are
-  the only COSE structures on the wire.
+- **COSE_Encrypt0** — the opportunistic chat's payload is a COSE_Encrypt0
+  structure (RFC 9052 §5.2), whose AEAD `external_aad` binds the envelope
+  fields around it. It is the only COSE structure on the wire.
 - **Everything else is raw and this protocol's own** — the announce, chat,
   rotate and link_proof signatures are plain ML-DSA signatures over the
   canonical byte string, link records are plain AES-256-GCM records, and there
   is no COSE_Sign1 anywhere.
 - **Canonical CBOR** — RFC 8949 §4.2.
-- **Link and group key schedules** — RFC 9180 §5.1 in shape, adapted with an
-  explicit suite byte in place of the unregistered ML-KEM KEM ID; the group
-  schedule uses the same labelled construction with `"cosechat/group ..."`
-  labels of its own.
+- **Link key schedule** — RFC 9180 §5.1 in shape, adapted with an explicit suite
+  byte in place of the unregistered ML-KEM KEM ID.
 - **Not covered by any standard** — the envelope shape, `hops`, the PoW
-  mechanism, admission pricing, the replay window, the continuity statement, the
-  group `gid` and its shared-secret membership model, and the road framing are
-  this protocol's own.
+  mechanism, admission pricing, the replay window, the continuity statement, and
+  the road framing are this protocol's own.
 
 ## Dependencies
 
@@ -737,12 +636,7 @@ reassemble inside the NimBLE / WiFi task and hand `recv()` a completed packet.
 or global** on MCUs — never as stack locals. `cc_relay_t` (4460 bytes at the
 default capacities) is the same kind of object, while `cc_link_t` (168 bytes),
 `cc_replay_t` (32 bytes) and `cc_revoked_t` (28 bytes) are small enough to live
-wherever the app keeps its peer table. Group state is small too: `cc_group_t` is
-41 bytes (the secret and the `gid` derived from it), `cc_group_win_t` 56 bytes
-per poster label (`gid` + poster + the 32-byte replay window) and a decrypted
-post 552 bytes, so an 8-member group costs 41 + 7 × 56 = 433 bytes plus one
-window per label the app chooses to police. A rotation costs no new per-peer
-state:
+wherever the app keeps its peer table. A rotation costs no new per-peer state:
 the predecessor address a rotation must be checked against is the 16-byte
 `prev_addr` field of the announce the caller already caches (so one cached peer
 is 3580 bytes with its replay and revocation records).
@@ -760,11 +654,11 @@ The reference firmware (`examples/cardputer`, ESP32-S3, 327680 B RAM and
 
 | Env | RAM | Flash |
 |-----|-----|-------|
-| `lora` | 221696 B (67.7%) | 668565 B (20.0%) |
-| `lora-relay` | 230624 B (70.4%) | 675129 B (20.2%) |
-| `ble` | 232544 B (71.0%) | 865089 B (25.9%) |
-| `dot11` | 245596 B (74.9%) | 1017349 B (30.4%) |
-| `wifi` | 247592 B (75.6%) | 1057881 B (31.7%) |
+| `lora` | 219088 B (66.9%) | 661993 B (19.8%) |
+| `lora-relay` | 227872 B (69.5%) | 667929 B (20.0%) |
+| `ble` | 229936 B (70.2%) | 858813 B (25.7%) |
+| `dot11` | 242988 B (74.2%) | 1011073 B (30.3%) |
+| `wifi` | 244984 B (74.8%) | 1051613 B (31.5%) |
 
 ## Storage posture
 
@@ -774,22 +668,16 @@ firmware's own account of the files, the fail-safes and the console commands:
 
 - **`/cc/key.bin` is the identity**, and it is stored as seeds: a form byte,
   the two 64-byte seeds and `sign_pub` (the form the firmware writes), so
-  reading the card makes you that node to every peer. **`/cc/group.bin` is a
-  membership**: the group secret sits beside the identity, so a card reader is
-  also a group member, able to read and mint posts.
+  reading the card makes you that node to every peer.
 - **Rollback is possible and is not detected.** `counter.bin`,
   `peers/<hex>.rp` and `revoked.bin` are trusted as read, so a *valid older*
   copy passes the envelope: a reused counter or `seq` makes peers drop this
   node's traffic as a replay or a stale announce until it passes their
   high-water marks, an older `.rp` lets one captured packet replay once, and an
-  older revocation file re-trusts a retired identity on this node. Two of the
-  files matter more than those three: an older `key.bin` reinstates an identity
-  the node has rotated (or revoked) away from — peers that recorded the rotation
-  or the revocation refuse it, so the node is mute until it rotates again — and
-  an older `group.bin` re-joins a group that may have been superseded, which
-  under "removal is a new group" can pull the node back into a conversation it
-  believed it had left, including one containing a member removed from the newer
-  group.
+  older revocation file re-trusts a retired identity on this node. One file
+  matters more than those three: an older `key.bin` reinstates an identity the
+  node has rotated (or revoked) away from — peers that recorded the rotation or
+  the revocation refuse it, so the node is mute until it rotates again.
 - **Every file carries a 9-byte envelope** — `"CCFS"`, a version and a CRC32 of
   the payload. The CRC **detects damage rather than authenticating**: anyone who
   can write the card can recompute it. What it buys is that a truncated or
@@ -839,10 +727,39 @@ dropping it would leave a ~129 B payload and give up the only cheap check. Form
 form): that is not corruption, so the node saves the expanded form, logs it and
 carries on, and the next identity it generates is compact again.
 
-**The honest limits.** No flash encryption, no secure boot and no passphrase are
-implemented; those are deployment and hardware decisions. Until one of them is
-in place, physical possession of the card is the security boundary, and the
-files are crash-proof, not tamper-proof.
+**The honest limits.** Nothing here is enabled by default: flash encryption and
+secure boot are the platform's, both off unless someone turns them on, and no
+code path in this node assumes either. A passphrase over the key file is not
+implemented at all. So by default physical possession of the card is the
+security boundary, and the files are crash-proof, not tamper-proof.
+
+### Hardening a real deployment
+
+Which of these is worth turning on is a deployment decision, but the options are
+concrete and each one buys something specific:
+
+- **Flash encryption** — makes the flash contents, whatever the app stores
+  there, unreadable off the device. It is a fuse burn: irreversible, it implies
+  re-flashing the board, and a lost or wrong key means the chip boots nothing.
+- **Secure boot v2** — verifies the boot image, so a modified image will not
+  run. Also fuse-based and irreversible.
+- **Keys in NVS instead of the card** — only meaningful together with flash
+  encryption (an encrypted NVS partition), and it gives up the "the card is the
+  identity" property on purpose: copying the card no longer copies the identity.
+- **A passphrase over the key file** — not implemented. It would need a KDF over
+  the passphrase, a way to enter it on the device, and a recovery path for a
+  forgotten phrase — that is the cost, and it is why the card's files are the
+  boundary today.
+
+Flash encryption and secure boot protect the flash; neither covers the removable
+card, which stays in the clear unless the app encrypts what it writes (it does
+not). So a card reader still *is* the identity, and the files are still readable
+and rollback-able, until the identity lives somewhere else — an encrypted NVS
+partition rather than the card. The node reports which measures are on at boot
+and on demand with the `i` console command, and the enablement route for this
+board and framework, with what the vendor framework does and does not expose, is
+documented with the firmware — see
+[Seeing the posture (and turning it on)](examples/cardputer/README.md#seeing-the-posture-and-turning-it-on).
 
 ## Examples & tests
 
@@ -850,7 +767,7 @@ files are crash-proof, not tamper-proof.
 - [`examples/announce.c`](examples/announce.c) — build and parse an announce (and read back the PoW cost it declares), presence, and key_req
 - [`examples/chat.c`](examples/chat.c) — Alice→Bob end to end: presence → key_req → announce → `cc_admit_for()` price → opportunistic chat (with a replay and a forged-sender rejection), then the link path (handshake, data both ways, identify, close)
 - [`examples/cardputer`](examples/cardputer) — node firmware for CardputerADV (LoRa cap, WiFi/UDP, anonymous BLE, or raw 802.11), plus a `lora-relay` env that compiles the relay behind `CC_RELAY`
-- [`test/test_cosechat.c`](test/test_cosechat.c) — protocol test suite (canonical form, field size contracts, coverage, replay classes, announce/presence lifecycles, link handshake and sequence window, rotation and revocation, group posts and their windows)
+- [`test/test_cosechat.c`](test/test_cosechat.c) — protocol test suite (canonical form, field size contracts, coverage, replay classes, announce/presence lifecycles, link handshake and sequence window, rotation and revocation, key seeds)
 - [`test/test_road.c`](test/test_road.c) — road framing (fragmentation/reassembly) tests
 - [`test/test_relay.c`](test/test_relay.c) — relay path learning, forwarding, hijack attempts, budgets, table pressure and a two-hop chain
 
@@ -886,23 +803,6 @@ What this revision of the code does and does not defend:
   attacks stay cheap. The `admit` declaration prices admission but is a speed
   bump, not a barrier; the relay's budgets and the app's rate limits are what
   actually bound a flood.
-- **A group post proves a key holder, not which member sent it** — the `poster`
-  field is self-claimed and non-binding: every member holds the same key and can
-  seal any other member's label, and because the sequence window is per label, a
-  member can silence another member's label by minting a high sequence under it.
-  Per-post signatures (the chat pattern, ~+3.3 KB or about 14 fragments) are
-  deliberately not implemented, so no policy may depend on the poster label.
-- **Membership is the secret, with no removal and no forward secrecy inside the
-  group** — there is no cryptographic removal: someone who has left still knows
-  the old secret, so the way to remove a member is to create a new group (new
-  secret, new unlinkable `gid`) and provision the remaining members. Whoever
-  holds the secret reads every post for as long as the group exists, a
-  compromised member reads and can forge posts, and whoever can read the store
-  the app keeps the exported secret in is a member.
-- **Older nodes and relays drop group traffic** — a revision-9 receiver that
-  predates the type answers `CC_E_FORMAT` (unknown type) and a revision-9 relay
-  will not forward it, so a group post only crosses a path where every hop
-  understands it.
 - **Presence and `key_req` are unauthenticated** — a presence is a hint, not a
   claim: it carries `addr` and `name_hash` and nothing signed, and its only
   trusted output is that an address we already hold a verified announce for is
@@ -937,12 +837,11 @@ What this revision of the code does and does not defend:
   there is no per-sender demultiplexing by design.
 - **The card is the identity, in the clear, and its files are not tamper-proof**
   — `/cc/key.bin` holds the identity unencrypted as seeds (the two 64-byte seeds
-  and `sign_pub`) and `/cc/group.bin` sits beside it, so physical access to the
-  card is permanent impersonation plus a group membership plus retroactive
-  decryption of anything captured. The counter, replay and revocation files are
-  trusted as read, so an older-but-valid copy is accepted (reused counters, one
-  replayed packet, a re-trusted retired identity, a rotated-away key, a
-  superseded group), and the per-file envelope's CRC detects damage rather than
+  and `sign_pub`), so physical access to the card is permanent impersonation
+  plus retroactive decryption of anything captured. The counter, replay and
+  revocation files are trusted as read, so an older-but-valid copy is accepted
+  (reused counters, one replayed packet, a re-trusted retired identity, a
+  rotated-away key), and the per-file envelope's CRC detects damage rather than
   authenticating it. A damaged key file — or no card at all — fails closed
   rather than re-identifying the node. The full picture, including the two
   key-file forms and what is not implemented (no flash encryption, no secure
@@ -974,7 +873,6 @@ What this revision of the code does and does not defend:
 | `CC_E_NOLINK` | -12 | Link id unknown, closed or expired — re-handshake |
 | `CC_E_SUITE` | -13 | Handshake suite byte is not `cc_suite()` |
 | `CC_E_REVOKED` | -14 | This address is retired — drop it, refuse links and rotations |
-| `CC_E_GROUP` | -15 | Not this group: a group post or record for a `gid` we do not hold |
 
 The road helpers return their own codes (`include/cosechat_road.h`):
 `CC_ROAD_OK` 0, `CC_ROAD_EMPTY` -1 (nothing waiting), `CC_ROAD_ERR` -2, plus the

@@ -100,27 +100,23 @@ add_test(NAME cosechat_road COMMAND test_road)
 
 # The relay (include/cosechat_relay.h) is host-testable for the same reason.
 # Its tables are shrunk on this target so table pressure is cheap to reach, and
-# its limits are retuned relative to the shipped defaults (three data packets,
-# two posts per group, and pools of 40960/32768/2048 bytes per window) so that
-# each limit can be reached and told apart with the packet sizes that class
-# really has: an announce ~6.5 KB, a chat ~4.5 KB, a group post 588 B at the
-# maximum (a 512-byte message, under 100 B for a short one), so the group pool
-# is small on purpose: a synthetic ~70 B post can exhaust it. The capacities
-# are compile-time by contract, and the shipped cosechat_relay library above
-# uses the defaults. The library is the pow1 one on purpose: the relay prices
-# forwarded data against that same build, so the difficulty cannot change a
-# single expectation below, while mining the fixture's announcements at the
-# default difficulty 2 would cost seconds of the suite for no added coverage
-# (the one test that needs a higher price mines it with the library itself,
-# which also pins the relay's own PoW digest).
+# its limits are retuned relative to the shipped defaults (three data packets
+# per destination, and pools of 40960/32768 bytes per window) so that each
+# limit can be reached and told apart with the packet sizes that class really
+# has: an announce ~6.5 KB and a chat ~4.5 KB on the wire, against the
+# synthetic ~70 B chats the suite builds to reach the pools cheaply. The
+# capacities are compile-time by contract, and the shipped cosechat_relay
+# library above uses the defaults. The library is the pow1 one on purpose: the
+# relay prices forwarded data against that same build, so the difficulty cannot
+# change a single expectation below, while mining the fixture's announcements
+# at the default difficulty 2 would cost seconds of the suite for no added
+# coverage (the one test that needs a higher price mines it with the library
+# itself, which also pins the relay's own PoW digest).
 add_executable(test_relay test/test_relay.c src/cosechat_relay.c)
 target_include_directories(test_relay PRIVATE include)
 target_link_libraries(test_relay PRIVATE cosechat_pow1)
 target_compile_definitions(test_relay PRIVATE CC_RELAY_PATHS=4
                                              CC_RELAY_FWD_BUDGET=3
-                                             CC_RELAY_GROUP_BUDGET=2
-                                             CC_RELAY_GIDS=4
                                              CC_RELAY_AIRTIME_ANNOUNCE=40960
-                                             CC_RELAY_AIRTIME_DATA=32768
-                                             CC_RELAY_AIRTIME_GROUP=2048)
+                                             CC_RELAY_AIRTIME_DATA=32768)
 add_test(NAME cosechat_relay COMMAND test_relay)
