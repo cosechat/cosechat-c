@@ -1,5 +1,8 @@
 # cosechat
 
+> [!WARNING]  
+> This was a very early brainstorming implementation. This is archived, and does not match the other implementations. Use the other projects in this GH org, instead.
+
 Post-quantum mesh chat protocol for microcontrollers and desktop. Inspired by [Reticulum](https://reticulum.network/) / LXMF.
 
 Portable C11: no platform headers, no dynamic allocation. The envelope is
